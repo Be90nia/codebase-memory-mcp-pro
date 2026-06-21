@@ -530,7 +530,9 @@ static bool incr_label_is_registry_symbol(const char *label) {
      * the same struct type nodes a full reindex would. */
     return label && (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0 ||
                      cbm_label_is_type_like(label) || strcmp(label, "Variable") == 0 ||
-                     strcmp(label, "Field") == 0);
+                     strcmp(label, "Field") == 0 ||
+                     /* Swift/Kotlin enum cases — mirror full-index registry (M2-c). */
+                     strcmp(label, "EnumCase") == 0);
 }
 
 /* Callback for cbm_gbuf_foreach_node: seed the registry with the existing

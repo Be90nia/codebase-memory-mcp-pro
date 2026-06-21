@@ -4781,7 +4781,9 @@ static void extract_csharp_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
 static bool is_enum_member_kind(const char *kind) {
     return strcmp(kind, "enum_member_declaration") == 0 || strcmp(kind, "enum_constant") == 0 ||
            strcmp(kind, "enum_member") == 0 || strcmp(kind, "enum_assignment") == 0 ||
-           strcmp(kind, "enumerator") == 0;
+           strcmp(kind, "enumerator") == 0 ||
+           /* Swift & Kotlin enum cases (the ONLY grammars that use `enum_entry`). */
+           strcmp(kind, "enum_entry") == 0;
 }
 
 /* Extract enum members as Variable nodes (C#, Java, TypeScript, C++). */
@@ -4791,12 +4793,45 @@ static void extract_enum_members(CBMExtractCtx *ctx, TSNode node, const char *cl
     if (ts_node_is_null(body)) {
         return;
     }
+    bool swiftish = (ctx->language == CBM_LANG_SWIFT || ctx->language == CBM_LANG_KOTLIN);
     uint32_t mc = ts_node_named_child_count(body);
     for (uint32_t mi = 0; mi < mc; mi++) {
         TSNode member = ts_node_named_child(body, mi);
         if (!is_enum_member_kind(ts_node_type(member))) {
             continue;
         }
+
+        /* Swift/Kotlin: one `enum_entry` may declare several comma-separated case
+         * names (`case a, b, c`). Each case identifier is a DIRECT `simple_identifier`
+         * child; associated-value types (`case foo(Int)`) and raw values (`= 1`) are
+         * nested / non-identifier children, so iterating direct simple_identifier
+         * children yields exactly the case names. Emit one EnumCase per name — a
+         * distinct kind from Variable (codegraph parity; cases were previously
+         * dropped entirely because `enum_entry` was not a recognized member kind). */
+        if (swiftish && strcmp(ts_node_type(member), "enum_entry") == 0) {
+            uint32_t cc = ts_node_named_child_count(member);
+            for (uint32_t ci = 0; ci < cc; ci++) {
+                TSNode cn = ts_node_named_child(member, ci);
+                if (strcmp(ts_node_type(cn), "simple_identifier") != 0) {
+                    continue;
+                }
+                char *case_name = cbm_node_text(a, cn, ctx->source);
+                if (!case_name || !case_name[0]) {
+                    continue;
+                }
+                CBMDefinition cdef;
+                memset(&cdef, 0, sizeof(cdef));
+                cdef.name = case_name;
+                cdef.qualified_name = cbm_arena_sprintf(a, "%s.%s", class_qn, case_name);
+                cdef.label = "EnumCase";
+                cdef.file_path = ctx->rel_path;
+                cdef.start_line = ts_node_start_point(cn).row + TS_LINE_OFFSET;
+                cdef.end_line = ts_node_end_point(member).row + TS_LINE_OFFSET;
+                cbm_defs_push(&ctx->result->defs, a, cdef);
+            }
+            continue;
+        }
+
         TSNode mname = ts_node_child_by_field_name(member, TS_FIELD("name"));
         if (ts_node_is_null(mname)) {
             mname = cbm_find_child_by_kind(member, "identifier");

@@ -334,14 +334,17 @@ typedef struct {
 static const tool_def_t TOOLS[] = {
     {"explore", "Explore",
      "PRIMARY exploration tool — call FIRST for 'how does X work', 'where is X', or surveying an "
-     "area. In ONE call returns the blast-radius (callers) AND the verbatim line-numbered source "
-     "of the matched symbols grouped by file — Read-equivalent, do NOT re-open the files shown. "
+     "area. In ONE call returns the blast-radius (callers), nearby NEIGHBORS (1-hop callees + "
+     "same-file symbols), AND the verbatim line-numbered source of the matched symbols grouped by "
+     "file — Read-equivalent, do NOT re-open the files shown. "
      "`query` is a space-separated bag of symbol/file names. Flags high-fan-in hotspots inline; "
      "for a precise sub-query use query_graph (openCypher).",
      "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":"
      "\"Space-separated symbol/file names to explore (first 16)\"},\"project\":{\"type\":\"string\"},"
      "\"max_files\":{\"type\":\"integer\",\"description\":\"max source blocks (default 8)\"},"
-     "\"depth\":{\"type\":\"integer\",\"description\":\"caller depth (default 1)\"}},"
+     "\"depth\":{\"type\":\"integer\",\"description\":\"caller depth (default 1)\"},"
+     "\"expand\":{\"type\":\"boolean\",\"description\":\"also list 1-hop neighbors — callees + "
+     "same-file symbols (default true)\"}},"
      "\"required\":[\"query\",\"project\"]}"},
     {"index_repository", "Index repository",
      "Index a repository into the knowledge graph. "
@@ -630,7 +633,7 @@ static const tool_def_t TOOLS[] = {
      "\"depth\":{\"type\":\"integer\",\"default\":2,\"description\":\"Max traversal hops from the "
      "changed symbols.\"},\"limit\":{\"type\":\"integer\",\"default\":200,\"maximum\":5000,"
      "\"description\":\"Per-symbol impacted rows shown (nearest hops first). impacted_total is "
-     "always exact and the impacted_modules rollup always complete regardless.\"},"
+     "always exact and the impacted_modules rollup always complete regardless.\"},
      "\"base_branch\":{\"type\":"
      "\"string\",\"default\":\"main\"},\"since\":{\"type\":\"string\",\"description\":"
      "\"Git ref or tag to compare from (e.g. HEAD~5, v0.5.0). Diffs <ref>...HEAD.\"},"
@@ -8891,6 +8894,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
 #ifdef _WIN32
         snprintf(mbcmd, sizeof(mbcmd), "git -C \"%s\" merge-base \"%s\" HEAD 2>NUL", root_path,
                  base_branch);
+                 base_branch);
 #else
         snprintf(mbcmd, sizeof(mbcmd), "git -C '%s' merge-base '%s' HEAD 2>/dev/null", root_path,
                  base_branch);
@@ -9053,6 +9057,15 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     free(files);
     free(seeds);
     free(direction);
+    yyjson_mut_obj_add_val(doc, root_obj, "changed_files", changed);
+    yyjson_mut_obj_add_int(doc, root_obj, "changed_count", file_count);
+    yyjson_mut_obj_add_val(doc, root_obj, "impacted_symbols", impacted);
+    yyjson_mut_obj_add_int(doc, root_obj, "impacted_count", seen.count);
+    yyjson_mut_obj_add_int(doc, root_obj, "depth", depth);
+    if (impacted_truncated) {
+        yyjson_mut_obj_add_bool(doc, root_obj, "impacted_truncated", true);
+    }
+
     free(root_path);
     free(project);
     free(base_branch);
@@ -9366,6 +9379,74 @@ static void expl_put_numbered(expl_buf_t *b, const char *src, int start_line) {
 #define strtok_r(s, delim, ctx) strtok_s(s, delim, ctx)
 #endif
 
+/* ── explore neighbor expansion (M2-a) ─────────────────────────────────────────
+ * 1-hop callees + same-file siblings, so one explore call covers the surrounding
+ * area (parity with codegraph's explore) while seeds/blast-radius/hotspots stay
+ * precisely attributed. Defaults ON; an explicit `expand:false` disables it. */
+enum { EXPL_MAX_NEIGHBORS = 20 };
+typedef struct {
+    int64_t id;
+    char *name, *file, *label;
+    int line;
+    const char *via; /* static string ("callee" / "same-file"), not owned */
+} expl_neighbor_t;
+
+static bool expl_get_expand(const char *args) {
+    yyjson_doc *doc = yyjson_read(args, strlen(args), 0);
+    bool expand = true; /* default ON */
+    if (doc) {
+        yyjson_val *val = yyjson_obj_get(yyjson_doc_get_root(doc), "expand");
+        if (val && yyjson_is_bool(val)) {
+            expand = yyjson_get_bool(val);
+        }
+        yyjson_doc_free(doc);
+    }
+    return expand;
+}
+
+/* Same-file lookups also return container/metadata nodes; keep only code symbols. */
+static bool expl_neighbor_label_ok(const char *label) {
+    if (!label) {
+        return false;
+    }
+    return strcmp(label, "File") != 0 && strcmp(label, "Folder") != 0 &&
+           strcmp(label, "Project") != 0 && strcmp(label, "Module") != 0 &&
+           strcmp(label, "Import") != 0 && strcmp(label, "Package") != 0 &&
+           strcmp(label, "Namespace") != 0;
+}
+
+/* Add `n` as a neighbor unless it is a seed or already collected. Sets *capped
+ * (and stops adding) once EXPL_MAX_NEIGHBORS is reached. Copies strings — the
+ * store's node memory is freed right after collection. */
+static void expl_try_add_neighbor(expl_neighbor_t *neigh, int *neigh_count, bool *capped,
+                                  const int64_t *seed_ids, int seed_count, const cbm_node_t *n,
+                                  const char *via) {
+    if (*capped || !n || n->id <= 0) {
+        return;
+    }
+    for (int j = 0; j < seed_count; j++) {
+        if (seed_ids[j] == n->id) {
+            return; /* a seed is shown above, not a neighbor */
+        }
+    }
+    for (int j = 0; j < *neigh_count; j++) {
+        if (neigh[j].id == n->id) {
+            return; /* already collected (e.g. callee that is also a same-file sibling) */
+        }
+    }
+    if (*neigh_count >= EXPL_MAX_NEIGHBORS) {
+        *capped = true;
+        return;
+    }
+    expl_neighbor_t *e = &neigh[(*neigh_count)++];
+    e->id = n->id;
+    e->name = heap_strdup(n->name ? n->name : "?");
+    e->file = heap_strdup(n->file_path ? n->file_path : "");
+    e->label = heap_strdup(n->label ? n->label : "");
+    e->line = n->start_line;
+    e->via = via;
+}
+
 static char *handle_explore(cbm_mcp_server_t *srv, const char *args) {
     char *query = cbm_mcp_get_string_arg(args, "query");
     char *project = cbm_mcp_get_string_arg(args, "project");
@@ -9375,6 +9456,7 @@ static char *handle_explore(cbm_mcp_server_t *srv, const char *args) {
     if (depth < 1) {
         depth = 1; /* 0/negative would silently yield an empty traversal */
     }
+    bool expand = expl_get_expand(args); /* neighbor expansion, default on */
 
     if (!query) {
         free(project);
@@ -9514,6 +9596,63 @@ static char *handle_explore(cbm_mcp_server_t *srv, const char *args) {
         expl_put(&md, "\n");
         cbm_store_traverse_free(&tr);
     }
+
+    /* ── neighbors: 1-hop callees + same-file siblings (M2-a) ── */
+    if (expand) {
+        int64_t seed_ids[EXPL_MAX_SEEDS];
+        for (int i = 0; i < seed_count; i++) {
+            seed_ids[i] = seeds[i].id;
+        }
+        expl_neighbor_t neigh[EXPL_MAX_NEIGHBORS];
+        int neigh_count = 0;
+        bool neigh_capped = false;
+        for (int i = 0; i < seed_count && !neigh_capped; i++) {
+            /* outbound callees (CALLS) — 1 hop */
+            cbm_traverse_result_t tro = {0};
+            cbm_store_bfs(store, seeds[i].id, "outbound", NULL, 0, 1, MCP_BFS_LIMIT, &tro);
+            for (int k = 0; k < tro.visited_count; k++) {
+                expl_try_add_neighbor(neigh, &neigh_count, &neigh_capped, seed_ids, seed_count,
+                                      &tro.visited[k].node, "callee");
+            }
+            cbm_store_traverse_free(&tro);
+            /* same-file siblings */
+            if (seeds[i].file[0]) {
+                cbm_node_t *fnodes = NULL;
+                int fn = 0;
+                cbm_store_find_nodes_by_file(store, project, seeds[i].file, &fnodes, &fn);
+                for (int k = 0; k < fn; k++) {
+                    if (!expl_neighbor_label_ok(fnodes[k].label)) {
+                        continue;
+                    }
+                    expl_try_add_neighbor(neigh, &neigh_count, &neigh_capped, seed_ids, seed_count,
+                                          &fnodes[k], "same-file");
+                }
+                cbm_store_free_nodes(fnodes, fn);
+            }
+        }
+        expl_put(&md, "\n## Neighbors — 1-hop callees + same-file symbols\n\n");
+        if (neigh_count == 0) {
+            expl_put(&md, "> _(none)_\n");
+        } else {
+            for (int i = 0; i < neigh_count; i++) {
+                /* Guard against heap_strdup OOM (NULL) — printf("%s",NULL) is UB. */
+                expl_putf(&md, "- `%s` (%s:%d) — %s · %s\n", neigh[i].name ? neigh[i].name : "?",
+                          neigh[i].file ? neigh[i].file : "?", neigh[i].line,
+                          neigh[i].label ? neigh[i].label : "?", neigh[i].via);
+            }
+            if (neigh_capped) {
+                expl_putf(&md, "> … +more omitted (showing first %d) — narrow the query or use "
+                               "`query_graph` for the full neighbor set.\n",
+                          EXPL_MAX_NEIGHBORS);
+            }
+        }
+        for (int i = 0; i < neigh_count; i++) {
+            free(neigh[i].name);
+            free(neigh[i].file);
+            free(neigh[i].label);
+        }
+    }
+
     expl_put(&md, "\n## Source\n\n> Verbatim on-disk source, line-numbered — Read-equivalent; "
                   "do NOT re-open the files shown below.\n\n");
     int files_shown = 0;
