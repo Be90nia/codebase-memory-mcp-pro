@@ -163,7 +163,8 @@ bool cbm_label_is_type_like(const char *label) {
     }
     return strcmp(label, "Class") == 0 || strcmp(label, "Struct") == 0 ||
            strcmp(label, "Interface") == 0 || strcmp(label, "Enum") == 0 ||
-           strcmp(label, "Type") == 0 || strcmp(label, "Trait") == 0;
+           strcmp(label, "Type") == 0 || strcmp(label, "Trait") == 0 ||
+           strcmp(label, "Actor") == 0;
 }
 
 bool cbm_is_keyword(const char *name, CBMLanguage lang) {

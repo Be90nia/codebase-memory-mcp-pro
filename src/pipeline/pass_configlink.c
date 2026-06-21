@@ -114,8 +114,10 @@ typedef struct {
 static int collect_code_entries(cbm_gbuf_t *gb, code_entry_t *out, int max_out) {
     int n = 0;
     /* "Struct" alongside "Class": a config key may name a Go/Rust/Swift/D struct
-     * type, which is now labelled "Struct" — keep it linkable. */
-    static const char *labels[] = {"Function", "Variable", "Class", "Struct", NULL};
+     * type, which is now labelled "Struct" — keep it linkable.
+     * Swift idiomatic kinds (Enum/Actor) included for parity. */
+    static const char *labels[] = {"Function", "Variable", "Class",
+                                   "Struct",   "Enum",     "Actor", NULL};
 
     for (int li = 0; labels[li] && n < max_out; li++) {
         const cbm_gbuf_node_t **nodes = NULL;
