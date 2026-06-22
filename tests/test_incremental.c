@@ -2982,6 +2982,46 @@ TEST(tool_delete_and_verify) {
     PASS();
 }
 
+/* M2-b2: detect_changes wires the (previously inert) `depth` param and emits an
+ * `impacted_total`. This asserts the response shape + depth clamping/echo on
+ * the shared fixture (an unchanged diff → counts may be 0, but the machinery and
+ * clamping are exercised deterministically). Uses format=json so depth is echoed
+ * as a JSON field (the tree encoder omits it). */
+TEST(tool_detect_changes_impacted_depth) {
+    double ms;
+
+    /* Default depth: new keys present. */
+    char *r = call_tool_timed("detect_changes", &ms, "{\"project\":\"%s\",\"format\":\"json\"}", g_project);
+    TOOL_OK(r, ms);
+    ASSERT(resp_has_key(r, "impacted_total"));
+    ASSERT(resp_has_key(r, "depth"));
+    free(r);
+
+    /* Explicit depth=0 → echoed verbatim (direct symbols only). */
+    r = call_tool_timed("detect_changes", &ms, "{\"project\":\"%s\",\"depth\":0,\"format\":\"json\"}", g_project);
+    TOOL_OK(r, ms);
+    ASSERT_EQ(count_in_response(r, "depth"), 0);
+    int impacted_0 = count_in_response(r, "impacted_total");
+    ASSERT_GTE(impacted_0, 0);
+    free(r);
+
+    /* depth=1 → echoed; impact set is a superset of depth=0 (transitive callers add). */
+    r = call_tool_timed("detect_changes", &ms, "{\"project\":\"%s\",\"depth\":1,\"format\":\"json\"}", g_project);
+    TOOL_OK(r, ms);
+    ASSERT_EQ(count_in_response(r, "depth"), 1);
+    ASSERT_GTE(count_in_response(r, "impacted_total"), impacted_0);
+    free(r);
+
+    /* Extreme depth=999 → clamped to MCP_MAX_DEPTH (15). */
+    r = call_tool_timed("detect_changes", &ms, "{\"project\":\"%s\",\"depth\":999,\"format\":\"json\"}", g_project);
+    TOOL_OK(r, ms);
+    ASSERT_LTE(count_in_response(r, "depth"), 15);
+    ASSERT_GTE(count_in_response(r, "depth"), 0);
+    free(r);
+
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
@@ -3129,6 +3169,7 @@ SUITE(incremental) {
     RUN_TEST(tool_detect_changes_since);
     RUN_TEST(tool_detect_changes_since_precedence);
     RUN_TEST(tool_detect_changes_depth);
+    RUN_TEST(tool_detect_changes_impacted_depth);
 
     /* Phase 16: manage_adr */
     RUN_TEST(tool_adr_get);

@@ -6918,6 +6918,68 @@ TEST(detect_changes_rejects_option_like_base_branch) {
     PASS();
 }
 
+/* M2-a: explore emits a "## Neighbors" section (1-hop CALLS callees + same-file
+ * siblings) by default. Populate the server's store with caller→callee plus a
+ * same-file sibling, then assert the section + neighbor names appear. */
+TEST(tool_explore_neighbors_expand_default) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *proj = "explore-neighbors";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/explore-neighbors");
+
+    cbm_node_t n_caller = {.project = proj,
+                           .label = "Function",
+                           .name = "caller",
+                           .qualified_name = "explore-neighbors.main.caller",
+                           .file_path = "main.go",
+                           .start_line = 10,
+                           .end_line = 15};
+    cbm_node_t n_callee = {.project = proj,
+                           .label = "Function",
+                           .name = "calleeFn",
+                           .qualified_name = "explore-neighbors.main.calleeFn",
+                           .file_path = "main.go",
+                           .start_line = 20,
+                           .end_line = 25};
+    cbm_node_t n_sibling = {.project = proj,
+                            .label = "Function",
+                            .name = "siblingFn",
+                            .qualified_name = "explore-neighbors.main.siblingFn",
+                            .file_path = "main.go",
+                            .start_line = 30,
+                            .end_line = 35};
+    int64_t id_caller = cbm_store_upsert_node(st, &n_caller);
+    int64_t id_callee = cbm_store_upsert_node(st, &n_callee);
+    ASSERT_GT(id_caller, 0);
+    ASSERT_GT(id_callee, 0);
+    ASSERT_GT(cbm_store_upsert_node(st, &n_sibling), 0);
+    cbm_edge_t e = {
+        .project = proj, .source_id = id_caller, .target_id = id_callee, .type = "CALLS"};
+    cbm_store_insert_edge(st, &e);
+
+    /* expand defaults to true (omitted) */
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":100,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"explore\","
+             "\"arguments\":{\"query\":\"caller\",\"project\":\"explore-neighbors\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+
+    ASSERT_NOT_NULL(strstr(inner, "## Neighbors"));
+    ASSERT_NOT_NULL(strstr(inner, "calleeFn"));  /* 1-hop outbound CALLS */
+    ASSERT_NOT_NULL(strstr(inner, "siblingFn")); /* same-file sibling */
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* Opt-in workspace boundary: when CBM_ALLOWED_ROOT is set, index_repository
  * must refuse a repo_path that resolves outside it. Unset (the default) imposes
  * no restriction. */
@@ -6944,6 +7006,58 @@ TEST(index_repository_honors_allowed_root) {
     cbm_unsetenv("CBM_ALLOWED_ROOT");
     cbm_mcp_server_free(srv);
     cbm_rmdir(allowed);
+    PASS();
+}
+
+/* M2-a: explore with expand:false suppresses the Neighbors section while keeping
+ * the Blast-radius and Source sections. */
+TEST(tool_explore_neighbors_expand_false) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *proj = "explore-no-neighbors";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/explore-no-neighbors");
+
+    cbm_node_t n_caller = {.project = proj,
+                           .label = "Function",
+                           .name = "caller",
+                           .qualified_name = "explore-no-neighbors.main.caller",
+                           .file_path = "main.go",
+                           .start_line = 10,
+                           .end_line = 15};
+    cbm_node_t n_callee = {.project = proj,
+                           .label = "Function",
+                           .name = "calleeFn",
+                           .qualified_name = "explore-no-neighbors.main.calleeFn",
+                           .file_path = "main.go",
+                           .start_line = 20,
+                           .end_line = 25};
+    int64_t id_caller = cbm_store_upsert_node(st, &n_caller);
+    int64_t id_callee = cbm_store_upsert_node(st, &n_callee);
+    ASSERT_GT(id_caller, 0);
+    ASSERT_GT(id_callee, 0);
+    cbm_edge_t e = {
+        .project = proj, .source_id = id_caller, .target_id = id_callee, .type = "CALLS"};
+    cbm_store_insert_edge(st, &e);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":101,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"explore\",\"arguments\":{\"query\":\"caller\","
+             "\"project\":\"explore-no-neighbors\",\"expand\":false}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+
+    ASSERT_NULL(strstr(inner, "## Neighbors")); /* suppressed */
+    ASSERT_NOT_NULL(strstr(inner, "## Blast radius"));
+    ASSERT_NOT_NULL(strstr(inner, "## Source"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
     PASS();
 }
 
@@ -7038,6 +7152,8 @@ SUITE(mcp) {
     RUN_TEST(tool_unknown_tool);
     RUN_TEST(tool_explore_requires_query);
     RUN_TEST(tool_explore_unindexed_no_crash);
+    RUN_TEST(tool_explore_neighbors_expand_default);
+    RUN_TEST(tool_explore_neighbors_expand_false);
     RUN_TEST(tool_search_graph_basic);
     RUN_TEST(tool_trace_totals_respect_test_filter);
     RUN_TEST(tool_get_architecture_cycles_detects_scc);

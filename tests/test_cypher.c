@@ -3045,6 +3045,47 @@ TEST(cypher_exec_deadline_allows_normal_query_issue601) {
     PASS();
 }
 
+/* M2-b1 regression: a non-aggregate function (type(r)) mixed with an aggregate
+ * (count(*)) must become a GROUPING dimension — one row per distinct edge type —
+ * not collapse every row into a single group. setup_cypher_store has 3 CALLS + 1
+ * DEFINES edge, so the correct result is 2 rows (CALLS=3, DEFINES=1); the bug
+ * produced a single collapsed row. */
+TEST(cypher_exec_type_aggregation_groups_per_type) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+
+    int rc = cbm_cypher_execute(s, "MATCH ()-[r]->() RETURN type(r) AS t, count(*) AS c", "test", 0,
+                                &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_EQ(r.col_count, 2);
+    /* CRITICAL: >=2 rows (one per edge type). Pre-fix this was 1 (collapsed). */
+    ASSERT_EQ(r.row_count, 2);
+    ASSERT_STR_EQ(r.columns[0], "t");
+    ASSERT_STR_EQ(r.columns[1], "c");
+
+    bool has_calls = false, has_defines = false;
+    for (int i = 0; i < r.row_count; i++) {
+        const char *type_val = r.rows[i][0];
+        const char *count_val = r.rows[i][1];
+        ASSERT_NOT_NULL(type_val);
+        ASSERT_NOT_NULL(count_val);
+        if (strcmp(type_val, "CALLS") == 0) {
+            has_calls = true;
+            ASSERT_STR_EQ(count_val, "3");
+        } else if (strcmp(type_val, "DEFINES") == 0) {
+            has_defines = true;
+            ASSERT_STR_EQ(count_val, "1");
+        }
+    }
+    ASSERT(has_calls);
+    ASSERT(has_defines);
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════ */
 
 SUITE(cypher) {
@@ -3222,4 +3263,9 @@ SUITE(cypher) {
     /* Composite property projection (arrays/objects, escaped quotes) */
     RUN_TEST(cypher_exec_prop_array_with_internal_commas);
     RUN_TEST(cypher_exec_prop_string_with_escaped_quote);
+    /* #601 deadline */
+    RUN_TEST(cypher_exec_deadline_aborts_runaway_query_issue601);
+    RUN_TEST(cypher_exec_deadline_allows_normal_query_issue601);
+    /* M2-b1: non-aggregate function grouping (type(r)) */
+    RUN_TEST(cypher_exec_type_aggregation_groups_per_type);
 }
