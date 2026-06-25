@@ -191,6 +191,7 @@ extern void suite_log(void);
 extern void suite_str_util(void);
 extern void suite_platform(void);
 extern void suite_subprocess(void);
+extern void suite_spawn_capture(void);
 extern void suite_extraction(void);
 extern void suite_extraction_inheritance(void);
 extern void suite_extraction_imports(void);
@@ -347,6 +348,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(platform);
     RUN_SELECTED_SUITE(subprocess);
     RUN_SELECTED_SUITE(dump_verify);
+    RUN_SELECTED_SUITE(spawn_capture);
 
     /* Existing C code regression tests */
     RUN_SELECTED_SUITE(ac);
