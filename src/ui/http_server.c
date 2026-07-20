@@ -23,9 +23,6 @@
 #include "cli/cli.h"
 #include "git/git_context.h"
 
-#if defined(HAVE_LIBGIT2)
-#include <git2.h> /* git_repository_open, git_remote_lookup, git_remote_url */
-#endif
 /* pipeline.h no longer needed — indexing runs as subprocess */
 #include "foundation/log.h"
 #include "foundation/platform.h"
@@ -266,29 +263,32 @@ char *cbm_ui_git_web_base(const char *url) {
 }
 
 /* Read the "origin" remote URL for the repo at root_path. malloc'd or NULL.
- * libgit2 is initialized once at process start by cbm_alloc_init() (which also
- * binds its allocator to mimalloc) — do NOT git_libgit2_init()/shutdown() here:
- * a per-request shutdown could drop the global refcount and tear down that
- * allocator binding mid-process. */
+ *
+ * libgit2 was removed from the build (license: GPLv2). We now spawn `git`
+ * directly via cbm_spawn_capture (shell-free: argv array to CreateProcessW /
+ * execvp; on Windows immune to cmd.exe AutoRun pollution, on POSIX no /bin/sh
+ * quoting surface). Returns malloc'd NUL-terminated string, caller frees.
+ */
 static char *git_origin_remote_url(const char *root_path) {
-#if defined(HAVE_LIBGIT2)
-    git_repository *repo = NULL;
-    char *out = NULL;
-    if (git_repository_open(&repo, root_path) == 0) {
-        git_remote *rem = NULL;
-        if (git_remote_lookup(&rem, repo, "origin") == 0) {
-            const char *u = git_remote_url(rem);
-            if (u)
-                out = strdup(u);
-            git_remote_free(rem);
-        }
-        git_repository_free(repo);
+    if (!root_path || !root_path[0]) {
+        return NULL;
     }
-    return out;
-#else
-    (void)root_path;
-    return NULL;
-#endif
+    const char *argv[] = {"git", "-C", root_path, "config", "--get", "remote.origin.url", NULL};
+    char *raw = NULL;
+    size_t raw_len = 0;
+    if (cbm_spawn_capture("git", argv, &raw, &raw_len) != 0 || !raw) {
+        free(raw);
+        return NULL;
+    }
+    /* strip trailing newline / carriage return */
+    while (raw_len > 0 && (raw[raw_len - 1] == '\n' || raw[raw_len - 1] == '\r')) {
+        raw[--raw_len] = '\0';
+    }
+    if (raw_len == 0) {
+        free(raw);
+        return NULL;
+    }
+    return raw;
 }
 
 /* GET /api/repo-info?project=NAME → { root_path, branch, remote_url, web_base,
