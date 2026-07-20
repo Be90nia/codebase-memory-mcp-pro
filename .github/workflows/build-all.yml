@@ -7,6 +7,8 @@ on:
 
 permissions:
   contents: read
+  id-token: write      # 必须授予 reusable workflow (_build.yml) 声明的权限
+  attestations: write  # GitHub Actions 强制 callee permissions 是 caller 子集
 
 jobs:
   build:
