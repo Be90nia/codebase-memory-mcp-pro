@@ -9361,6 +9361,11 @@ static void expl_put_numbered(expl_buf_t *b, const char *src, int start_line) {
     }
 }
 
+/* Windows MSVC CRT lacks POSIX strtok_r; strtok_s has identical signature. */
+#ifdef _WIN32
+#define strtok_r(s, delim, ctx) strtok_s(s, delim, ctx)
+#endif
+
 static char *handle_explore(cbm_mcp_server_t *srv, const char *args) {
     char *query = cbm_mcp_get_string_arg(args, "query");
     char *project = cbm_mcp_get_string_arg(args, "project");
