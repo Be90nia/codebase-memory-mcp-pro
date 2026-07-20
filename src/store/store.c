@@ -154,24 +154,61 @@ static void store_set_error_sqlite(cbm_store_t *s, const char *prefix) {
     snprintf(s->errbuf, sizeof(s->errbuf), "%s: %s", prefix, sqlite3_errmsg(s->db));
 }
 
-static int exec_sql(cbm_store_t *s, const char *sql) {
-    if (!s || !s->db) {
-        return CBM_STORE_ERR;
-    }
-    char *err = NULL;
-    int rc = sqlite3_exec(s->db, sql, NULL, NULL, &err);
-    if (rc != SQLITE_OK) {
-        snprintf(s->errbuf, sizeof(s->errbuf), "exec: %s", err ? err : "unknown");
-        sqlite3_free(err);
-        return CBM_STORE_ERR;
-    }
-    return CBM_STORE_OK;
-}
-
 /* Safe string: returns "" if NULL. */
 static const char *safe_str(const char *s) {
     return s ? s : "";
 }
+
+/* SQLITE_BUSY retry budget. The PRAGMA busy_timeout (set in configure_pragmas)
+ * handles most waits inside SQLite at the connection level. But two cases
+ * still surface SQLITE_BUSY to exec_sql callers:
+ *   1. Multi-step transactions: busy_timeout applies per lock-acquire, so
+ *      a second acquire inside the same outer transaction can fail.
+ *   2. WAL checkpoint starvation: PASSIVE checkpoint (cbm_store_close/open)
+ *      cannot make progress while a concurrent reader (often a Windows
+ *      Defender real-time scan of the .db file) holds a shared lock.
+ * The retry below adds a second line of defense with exponential backoff
+ * (100/200/400ms, ~700ms total) before propagating the error. Diagnostic
+ * logs on exhaustion pinpoint the contention source for follow-up. */
+#define EXEC_BUSY_MAX_RETRIES 3
+#define EXEC_BUSY_BACKOFF_NS 100000000L /* 100ms, shifted per attempt */
+
+static int exec_sql(cbm_store_t *s, const char *sql) {
+    if (!s || !s->db) {
+        return CBM_STORE_ERR;
+    }
+
+    for (int attempt = 0; attempt < EXEC_BUSY_MAX_RETRIES; attempt++) {
+        char *err = NULL;
+        int rc = sqlite3_exec(s->db, sql, NULL, NULL, &err);
+        if (rc == SQLITE_OK) {
+            sqlite3_free(err);
+            return CBM_STORE_OK;
+        }
+
+        bool busy = (rc == SQLITE_BUSY || rc == SQLITE_LOCKED);
+        snprintf(s->errbuf, sizeof(s->errbuf), "exec: %s", err ? err : "unknown");
+
+        if (!busy || attempt == EXEC_BUSY_MAX_RETRIES - 1) {
+            if (busy) {
+                char rc_buf[ST_BUF_16];
+                snprintf(rc_buf, sizeof(rc_buf), "%d", rc);
+                cbm_log_warn("store.busy_exhausted", "db_path", safe_str(s->db_path),
+                             "rc", rc_buf,
+                             "hint", "concurrent reader/writer holds the lock too long");
+            }
+            sqlite3_free(err);
+            return CBM_STORE_ERR;
+        }
+
+        sqlite3_free(err);
+        struct timespec ts = {0, EXEC_BUSY_BACKOFF_NS << attempt};
+        cbm_nanosleep(&ts, NULL);
+    }
+
+    return CBM_STORE_ERR;
+}
+
 
 /* Safe properties: returns "{}" if NULL. */
 static const char *safe_props(const char *s) {
@@ -411,7 +448,7 @@ static int configure_pragmas(cbm_store_t *s, bool in_memory, bool read_only) {
         rc = exec_sql(s, "PRAGMA synchronous = OFF;");
     } else if (read_only) {
         /* Non-writing pragmas only — see the function comment. */
-        rc = exec_sql(s, "PRAGMA busy_timeout = 10000;");
+        rc = exec_sql(s, "PRAGMA busy_timeout = 60000;");
         if (rc != CBM_STORE_OK) {
             return rc;
         }
@@ -420,7 +457,7 @@ static int configure_pragmas(cbm_store_t *s, bool in_memory, bool read_only) {
                  (long long)cbm_store_resolve_mmap_size());
         rc = exec_sql(s, mmap_sql);
     } else {
-        rc = exec_sql(s, "PRAGMA busy_timeout = 10000;");
+        rc = exec_sql(s, "PRAGMA busy_timeout = 60000;");
         if (rc != CBM_STORE_OK) {
             return rc;
         }
