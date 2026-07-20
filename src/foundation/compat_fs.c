@@ -627,15 +627,19 @@ int cbm_spawn_capture(const char *exe, const char *const *argv,
         return CBM_NOT_FOUND;
     }
 
-    /* lpApplicationName = explicit exe path (no shell interpretation, no AutoRun).
-     * lpCommandLine = argv joined with strict double-quote escaping so the
-     * target program parses argv correctly without cmd.exe ever seeing it. */
+    /* Resolve exe to a full path via SearchPathW so CreateProcessW's
+     * lpApplicationName receives an absolute path (no CWD planting risk).
+     * If SearchPathW fails (exe not on PATH), fall back to lpApplicationName=NULL
+     * so lpCommandLine's first token does the PATH search instead. */
     wchar_t wexe[CBM_PATH_MAX];
+    wchar_t wexe_resolved[CBM_PATH_MAX];
     if (MultiByteToWideChar(CP_UTF8, 0, exe, -1, wexe, CBM_PATH_MAX) <= 0) {
         CloseHandle(pipe_r);
         CloseHandle(pipe_w);
         return CBM_NOT_FOUND;
     }
+    DWORD found = SearchPathW(NULL, wexe, L".exe", CBM_PATH_MAX, wexe_resolved, NULL);
+    wchar_t *lpApp = (found > 0 && found < CBM_PATH_MAX) ? wexe_resolved : NULL;
 
     wchar_t cmdline[CBM_SZ_8K];
     int pos = 0;
@@ -669,7 +673,7 @@ int cbm_spawn_capture(const char *exe, const char *const *argv,
     si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
 
     PROCESS_INFORMATION pi = {0};
-    BOOL ok = CreateProcessW(wexe, cmdline, NULL, NULL, TRUE,
+    BOOL ok = CreateProcessW(lpApp, cmdline, NULL, NULL, TRUE,
                              CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
     CloseHandle(pipe_w);
     if (!ok) {
