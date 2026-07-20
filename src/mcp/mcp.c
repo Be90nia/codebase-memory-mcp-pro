@@ -633,7 +633,7 @@ static const tool_def_t TOOLS[] = {
      "\"depth\":{\"type\":\"integer\",\"default\":2,\"description\":\"Max traversal hops from the "
      "changed symbols.\"},\"limit\":{\"type\":\"integer\",\"default\":200,\"maximum\":5000,"
      "\"description\":\"Per-symbol impacted rows shown (nearest hops first). impacted_total is "
-     "always exact and the impacted_modules rollup always complete regardless.\""},
+     "always exact and the impacted_modules rollup always complete regardless.\"},"
      "\"base_branch\":{\"type\":"
      "\"string\",\"default\":\"main\"},\"since\":{\"type\":\"string\",\"description\":"
      "\"Git ref or tag to compare from (e.g. HEAD~5, v0.5.0). Diffs <ref>...HEAD.\"},"
