@@ -1244,6 +1244,44 @@ char *cbm_mcp_get_arguments(const char *params_json) {
 
 char *cbm_mcp_get_string_arg(const char *args_json, const char *key) {
     yyjson_doc *doc = yyjson_read(args_json, strlen(args_json), 0);
+    /* Windows-path fallback: raw JSON / args-file / stdin modes receive Windows
+     * paths with single backslashes (C:\Users\...), which violates JSON spec —
+     * \U, \B, \A are not valid escapes, so yyjson rejects the WHOLE doc and every
+     * field lookup silently returns NULL. The user-visible symptom is
+     * "repo_path is required" with no hint that the JSON itself was bad.
+     * When the strict parse fails AND the input contains a backslash, walk the
+     * string and double every backslash that is NOT already part of a valid
+     * JSON escape (\" \\ \/ \b \f \n \r \t \uXXXX), then retry. Successful parses
+     * are unaffected; only previously-failing inputs reach the fallback. */
+    if (!doc && strchr(args_json, '\\')) {
+        size_t n = strlen(args_json);
+        char *fixed = malloc(n * 2 + 1);
+        if (fixed) {
+            size_t j = 0;
+            for (size_t i = 0; i < n; i++) {
+                if (args_json[i] == '\\' && i + 1 < n) {
+                    char next = args_json[i + 1];
+                    if (next == '"' || next == '\\' || next == '/' ||
+                        next == 'b' || next == 'f' || next == 'n' ||
+                        next == 'r' || next == 't' || next == 'u') {
+                        /* Already a legal JSON escape: copy both chars as-is. */
+                        fixed[j++] = '\\';
+                        fixed[j++] = next;
+                        i++;
+                    } else {
+                        /* Unrecognized (\\U, \\B, \\A, ...): escape the lone backslash. */
+                        fixed[j++] = '\\';
+                        fixed[j++] = '\\';
+                    }
+                } else {
+                    fixed[j++] = args_json[i];
+                }
+            }
+            fixed[j] = '\0';
+            doc = yyjson_read(fixed, j, 0);
+            free(fixed);
+        }
+    }
     if (!doc) {
         return NULL;
     }

@@ -4836,6 +4836,20 @@ TEST(mcp_get_string_arg_int_value) {
     PASS();
 }
 
+TEST(mcp_get_string_arg_windows_path_backslash_fallback) {
+    /* Windows path with single backslashes is invalid JSON (\U, \a, \s are
+     * not legal JSON escapes). Strict yyjson rejects the whole doc; the
+     * fallback escapes the lone backslashes so the field is recoverable.
+     * Regression guard for the silent "repo_path is required" failure that
+     * hid the JSON parse error on Windows. */
+    const char *args = "{\"repo_path\":\"C:\\Users\\alice\\src\"}";
+    char *val = cbm_mcp_get_string_arg(args, "repo_path");
+    ASSERT_NOT_NULL(val);
+    ASSERT_STR_EQ(val, "C:\\Users\\alice\\src");
+    free(val);
+    PASS();
+}
+
 TEST(mcp_get_int_arg_empty_json) {
     int val = cbm_mcp_get_int_arg("", "key", 99);
     ASSERT_EQ(val, 99);
@@ -7116,6 +7130,7 @@ SUITE(mcp) {
     RUN_TEST(mcp_get_string_arg_empty_object);
     RUN_TEST(mcp_get_string_arg_nested_value);
     RUN_TEST(mcp_get_string_arg_int_value);
+    RUN_TEST(mcp_get_string_arg_windows_path_backslash_fallback);
     RUN_TEST(mcp_get_int_arg_empty_json);
     RUN_TEST(mcp_get_int_arg_string_value);
     RUN_TEST(mcp_get_int_arg_bool_value);
