@@ -8894,7 +8894,6 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
 #ifdef _WIN32
         snprintf(mbcmd, sizeof(mbcmd), "git -C \"%s\" merge-base \"%s\" HEAD 2>NUL", root_path,
                  base_branch);
-                 base_branch);
 #else
         snprintf(mbcmd, sizeof(mbcmd), "git -C '%s' merge-base '%s' HEAD 2>/dev/null", root_path,
                  base_branch);
