@@ -274,7 +274,7 @@ TEST(mem_rss_reflects_external_resident_memory) {
      * warm buffer. This still guards the real regression — cbm_mem_rss()
      * reporting a broken small counter instead of true resident memory — which
      * the Linux #else branch exercises directly against the undercount. */
-    const size_t threshold = (size_t)32 * 1024 * 1024;
+    const size_t threshold = (size_t)8 * 1024 * 1024; /* 8 MB: survives ARM trimming, still >> 1 MB warm */
     void *big = malloc(region);
     ASSERT_NOT_NULL(big);
     memset(big, 0x5A, region);
