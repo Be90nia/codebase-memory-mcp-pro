@@ -883,8 +883,22 @@ static bool cbm_json_mcp_owned_command(const char *command, const char *expected
     if (expected_binary && expected_binary[0] && strcmp(command, expected_binary) == 0) {
         return true;
     }
-    return strcmp(command, "codebase-memory-mcp") == 0 ||
-           strcmp(command, "codebase-memory-mcp.exe") == 0;
+    if (strcmp(command, "codebase-memory-mcp") == 0 ||
+        strcmp(command, "codebase-memory-mcp.exe") == 0) {
+        return true;
+    }
+    /* Check basename of absolute/relative paths (e.g. /old/stale/codebase-memory-mcp) */
+    const char *slash = strrchr(command, '/');
+    const char *backslash = strrchr(command, '\\');
+    const char *base = (backslash && (!slash || backslash > slash)) ? backslash : slash;
+    if (base) {
+        base++;
+        if (strcmp(base, "codebase-memory-mcp") == 0 ||
+            strcmp(base, "codebase-memory-mcp.exe") == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static int cbm_json_mcp_snapshot_ownership(const char *document, size_t document_length,
@@ -924,8 +938,6 @@ static int cbm_upsert_json_named_mcp(const char *binary_path, const char *config
         switch (ownership) {
         case CBM_JSON_LIKE_OBJECT_MATCH:
         case CBM_JSON_LIKE_OBJECT_MISSING:
-        /* MISMATCH: stale binary path from previous install; upsert must overwrite */
-        case CBM_JSON_LIKE_OBJECT_MISMATCH:
             break;
         default:
             free(document);
