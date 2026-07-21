@@ -989,10 +989,11 @@ int cbm_spawn_capture(const char *exe, const char *const *argv, char **out, size
     if (out_len)
         *out_len = total;
     if (WIFEXITED(status)) {
-        /* Return exit code even when child produced no output.
-         * Out is NULL but caller gets the real exit code (e.g. /bin/false → 1).
-         * ponytail: out==NULL on empty stdout is fine; caller checks rc first. */
-        return WEXITSTATUS(status);
+        int ec = WEXITSTATUS(status);
+        /* 127 is the POSIX convention for execvp failure (command not found).
+         * Map it to CBM_NOT_FOUND so callers can distinguish "exe not found"
+         * from "exe ran and exited with code N". */
+        return ec == 127 ? CBM_NOT_FOUND : ec;
     }
     free(result);
     return CBM_NOT_FOUND; /* killed by signal */
