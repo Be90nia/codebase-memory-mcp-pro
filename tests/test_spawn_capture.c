@@ -8,6 +8,15 @@
  * integration tests require a spawnable echo/printf, so POSIX-only.
  */
 #include "test_framework.h"
+
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
+#if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
+#define CBM_ASAN_ACTIVE 1
+#else
+#define CBM_ASAN_ACTIVE 0
+#endif
 #include "../src/foundation/compat_fs.h"
 #include "../src/foundation/constants.h"
 #include <stdlib.h>
@@ -117,7 +126,7 @@ TEST(find_validated_line_empty_text) {
  * these integration tests prove the wiring on POSIX where /bin/echo and
  * /usr/bin/printf are real executables. */
 
-#if !defined(_WIN32) && !defined(__SANITIZE_ADDRESS__)
+#if !defined(_WIN32) && !CBM_ASAN_ACTIVE
 
 TEST(spawn_capture_basic_echo) {
     const char *argv[] = {"/bin/echo", "hello-world", NULL};
@@ -177,7 +186,7 @@ TEST(spawn_capture_validated_fails_loud_when_no_match) {
 }
 
 
-#endif /* !_WIN32 && !__SANITIZE_ADDRESS__ */
+#endif /* !_WIN32 && !CBM_ASAN_ACTIVE */
 
 SUITE(spawn_capture) {
     RUN_TEST(find_validated_line_finds_first_match);
@@ -189,7 +198,7 @@ SUITE(spawn_capture) {
     RUN_TEST(find_validated_line_null_safety);
     RUN_TEST(find_validated_line_empty_text);
 #ifndef _WIN32
-#if !defined(__SANITIZE_ADDRESS__)
+#if !CBM_ASAN_ACTIVE
     /* ASAN does not support fork(): child process can trigger DEADLYSIGNAL.
      * These integration tests use cbm_spawn_capture which calls fork+execvp.
      * Skip under ASAN to avoid false failures. */

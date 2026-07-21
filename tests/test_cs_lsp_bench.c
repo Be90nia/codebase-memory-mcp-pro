@@ -27,6 +27,15 @@
  * the gap is dominated by ctor-synthetic 0.50 markers and BCL long tail).
  */
 #include "test_framework.h"
+
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
+#if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
+#define CBM_ASAN_ACTIVE 1
+#else
+#define CBM_ASAN_ACTIVE 0
+#endif
 #include "cbm.h"
 #include "lsp/cs_lsp.h"
 #include <stdlib.h>
@@ -238,7 +247,7 @@ TEST(cslsp_bench_resolution_ratio) {
     /* Time budget. ASan+UBSan instrumentation slows the parse ~5-10×, so
      * scale the budget when a sanitizer is active. Native: 200 ms for a
      * ~260-line fixture; sanitized: 2000 ms. */
-#ifdef __SANITIZE_ADDRESS__
+#if CBM_ASAN_ACTIVE
     ASSERT(ms < 2000.0);
 #else
     ASSERT(ms < 200.0);

@@ -26,6 +26,15 @@
  * is 95%+ — see docs/BENCHMARK_PYTHON.md).
  */
 #include "test_framework.h"
+
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
+#if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
+#define CBM_ASAN_ACTIVE 1
+#else
+#define CBM_ASAN_ACTIVE 0
+#endif
 #include "cbm.h"
 #include "lsp/py_lsp.h"
 #include <stdlib.h>
@@ -258,7 +267,7 @@ TEST(pylsp_bench_resolution_ratio) {
     /* Time budget. ASan+UBSan instrumentation slows the parse ~5-10×, so
      * scale the budget when a sanitizer is active. Native: 150 ms for a
      * ~200-line fixture; sanitized: 1500 ms. */
-#ifdef __SANITIZE_ADDRESS__
+#if CBM_ASAN_ACTIVE
     ASSERT(ms < 1500.0);
 #else
     ASSERT(ms < 150.0);

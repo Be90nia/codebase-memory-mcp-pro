@@ -27,6 +27,14 @@
 #include "test_helpers.h"
 #include "git/git_context.h"
 
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
+#if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
+#define CBM_ASAN_ACTIVE 1
+#else
+#define CBM_ASAN_ACTIVE 0
+#endif
 #include <stdio.h>
 #include <string.h>
 
@@ -111,7 +119,7 @@ TEST(canonical_root_repo_root) {
  * textually, leaving canonical_root = "<root>/subdir/.." (or "<root>/..") instead
  * of "<root>". Verified RED on the unfixed code, GREEN with the realpath fix. */
 
-#if !defined(__SANITIZE_ADDRESS__)
+#if !CBM_ASAN_ACTIVE
 /* ASAN does not support fork: canonical_root_subdir calls git_capture
  * which uses fork+execvp — skip the whole function under ASAN. */
 TEST(canonical_root_subdir) {
@@ -162,7 +170,7 @@ TEST(canonical_root_subdir) {
     PASS();
 #endif /* _WIN32 */
 }
-#endif /* !__SANITIZE_ADDRESS__ */
+#endif /* !CBM_ASAN_ACTIVE */
 
 /* ── canonical_root: linked git worktree (supporting invariant) ────
  * NOT the #659 reproducer on modern git: git that emits an *absolute*
@@ -173,7 +181,7 @@ TEST(canonical_root_subdir) {
  * build that emits a *relative* worktree common-dir. The genuine RED-without-fix
  * guard for #659 is canonical_root_subdir above. */
 
-#if !defined(__SANITIZE_ADDRESS__)
+#if !CBM_ASAN_ACTIVE
 
 TEST(canonical_root_linked_worktree) {
 #ifdef _WIN32
@@ -247,13 +255,13 @@ TEST(canonical_root_linked_worktree) {
     PASS();
 #endif /* _WIN32 */
 }
-#endif /* !__SANITIZE_ADDRESS__ */
+#endif /* !CBM_ASAN_ACTIVE */
 
 /* ── Suite ──────────────────────────────────────────────────────── */
 
 SUITE(git_context) {
     RUN_TEST(canonical_root_repo_root);
-#if !defined(__SANITIZE_ADDRESS__)
+#if !CBM_ASAN_ACTIVE
     /* canonical_root_subdir and canonical_root_linked_worktree call git_capture
      * which uses fork+execvp — ASAN does not support fork. */
     RUN_TEST(canonical_root_subdir);
