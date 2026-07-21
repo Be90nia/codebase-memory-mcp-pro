@@ -111,6 +111,9 @@ TEST(canonical_root_repo_root) {
  * textually, leaving canonical_root = "<root>/subdir/.." (or "<root>/..") instead
  * of "<root>". Verified RED on the unfixed code, GREEN with the realpath fix. */
 
+#if !defined(__SANITIZE_ADDRESS__)
+/* ASAN does not support fork: canonical_root_subdir calls git_capture
+ * which uses fork+execvp — skip the whole function under ASAN. */
 TEST(canonical_root_subdir) {
 #ifdef _WIN32
     SKIP_PLATFORM("git-based canonical_root test not supported on Windows CI");
@@ -159,6 +162,7 @@ TEST(canonical_root_subdir) {
     PASS();
 #endif /* _WIN32 */
 }
+#endif /* !__SANITIZE_ADDRESS__ */
 
 /* ── canonical_root: linked git worktree (supporting invariant) ────
  * NOT the #659 reproducer on modern git: git that emits an *absolute*
@@ -168,6 +172,8 @@ TEST(canonical_root_subdir) {
  * MAIN repo root (never the worktree root or its parent) — and would fail on a git
  * build that emits a *relative* worktree common-dir. The genuine RED-without-fix
  * guard for #659 is canonical_root_subdir above. */
+
+#if !defined(__SANITIZE_ADDRESS__)
 
 TEST(canonical_root_linked_worktree) {
 #ifdef _WIN32
@@ -241,6 +247,7 @@ TEST(canonical_root_linked_worktree) {
     PASS();
 #endif /* _WIN32 */
 }
+#endif /* !__SANITIZE_ADDRESS__ */
 
 /* ── Suite ──────────────────────────────────────────────────────── */
 

@@ -117,7 +117,7 @@ TEST(find_validated_line_empty_text) {
  * these integration tests prove the wiring on POSIX where /bin/echo and
  * /usr/bin/printf are real executables. */
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__SANITIZE_ADDRESS__)
 
 TEST(spawn_capture_basic_echo) {
     const char *argv[] = {"/bin/echo", "hello-world", NULL};
@@ -176,7 +176,8 @@ TEST(spawn_capture_validated_fails_loud_when_no_match) {
     PASS();
 }
 
-#endif /* _WIN32 */
+
+#endif /* !_WIN32 && !__SANITIZE_ADDRESS__ */
 
 SUITE(spawn_capture) {
     RUN_TEST(find_validated_line_finds_first_match);
