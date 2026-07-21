@@ -988,8 +988,6 @@ int cbm_spawn_capture(const char *exe, const char *const *argv, char **out, size
     *out = result; /* NULL when child produced no output; caller initialized *out=NULL above */
     if (out_len)
         *out_len = total;
-
-
     if (WIFEXITED(status)) {
         /* Return exit code even when child produced no output.
          * Out is NULL but caller gets the real exit code (e.g. /bin/false → 1).
