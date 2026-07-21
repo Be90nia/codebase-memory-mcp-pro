@@ -2658,7 +2658,7 @@ if [ -n "${SMOKE_DOWNLOAD_URL:-}" ]; then
   fi
 
   # Pre-install agent config with a WRONG binary path (simulates stale config)
-  echo '{"mcpServers":{"codebase-memory-mcp":{"command":"/old/stale/codebase-memory-mcp"}}}' > "$UPDATE_HOME/.claude.json"
+  echo '{"mcpServers":{"codebase-memory-mcp":{"command":"/old/stale/path"}}}' > "$UPDATE_HOME/.claude.json"
 
   # 14a: Run actual update command (detect variant from available archive)
   UPDATE_VARIANT="--standard"
@@ -2685,7 +2685,7 @@ if [ -n "${SMOKE_DOWNLOAD_URL:-}" ]; then
 
   # 14c: Verify agent config was refreshed (stale path replaced)
   UPD_CMD=$(cat "$UPDATE_HOME/.claude.json" 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('mcpServers',{}).get('codebase-memory-mcp',{}).get('command',''))" 2>/dev/null || echo "")
-  if [ "$UPD_CMD" = "/old/stale/codebase-memory-mcp" ]; then
+  if [ "$UPD_CMD" = "/old/stale/path" ]; then
     echo "FAIL 14c: agent config still has stale path after update"
     exit 1
   fi

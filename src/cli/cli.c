@@ -887,17 +887,8 @@ static bool cbm_json_mcp_owned_command(const char *command, const char *expected
         strcmp(command, "codebase-memory-mcp.exe") == 0) {
         return true;
     }
-    /* Check basename of absolute/relative paths (e.g. /old/stale/codebase-memory-mcp) */
-    const char *slash = strrchr(command, '/');
-    const char *backslash = strrchr(command, '\\');
-    const char *base = (backslash && (!slash || backslash > slash)) ? backslash : slash;
-    if (base) {
-        base++;
-        if (strcmp(base, "codebase-memory-mcp") == 0 ||
-            strcmp(base, "codebase-memory-mcp.exe") == 0) {
-            return true;
-        }
-    }
+    /* No basename matching: /opt/custom/codebase-memory-mcp is foreign, not ours.
+     * The update path sets g_mcp_upsert_force to overwrite stale paths. */
     return false;
 }
 
@@ -917,6 +908,10 @@ static int cbm_json_mcp_snapshot_ownership(const char *document, size_t document
     free(command);
     return result;
 }
+
+/* When true, cbm_upsert_json_named_mcp allows overwriting MISMATCH entries (stale paths).
+ * Set by cbm_install_agent_configs during update; install leaves it false. */
+static bool g_mcp_upsert_force = false;
 
 static int cbm_upsert_json_named_mcp(const char *binary_path, const char *config_path,
                                      const char *const *object_path, size_t path_len,
@@ -939,6 +934,9 @@ static int cbm_upsert_json_named_mcp(const char *binary_path, const char *config
         case CBM_JSON_LIKE_OBJECT_MATCH:
         case CBM_JSON_LIKE_OBJECT_MISSING:
             break;
+        case CBM_JSON_LIKE_OBJECT_MISMATCH:
+            if (g_mcp_upsert_force) break; /* update: overwrite stale paths */
+            /* fall through: install rejects foreign entries */
         default:
             free(document);
             return CLI_ERR;
@@ -7327,6 +7325,7 @@ static void install_additional_agent_configs(const cbm_detected_agents_t *agents
 
 int cbm_install_agent_configs(const char *home, const char *binary_path, bool force, bool dry_run) {
     g_agent_install_errors = 0;
+    g_mcp_upsert_force = force;
     cbm_detected_agents_t agents = cbm_detect_agents(home);
     if (!g_install_plan) {
         print_detected_agents(&agents, home);
