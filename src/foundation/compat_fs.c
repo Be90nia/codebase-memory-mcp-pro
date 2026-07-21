@@ -944,8 +944,7 @@ int cbm_spawn_capture(const char *exe, const char *const *argv, char **out, size
         return CBM_NOT_FOUND;
     }
     if (pid == 0) {
-        /* Child: wire stdout to pipe write end, then execvp directly.
-         * No shell, no AutoRun-equivalent on POSIX.
+        /* Child: wire stdout to pipe write end, then execvp directly. */
         close(pipefd[0]);
         if (dup2(pipefd[1], STDOUT_FILENO) < 0) {
             _exit(127);
