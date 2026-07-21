@@ -1,4 +1,4 @@
-/*
+﻿/*
  * cli.c — CLI subcommand handlers for install, uninstall, update, version.
  *
  * Port of Go cmd/codebase-memory-mcp/ install/update logic.
@@ -935,7 +935,8 @@ static int cbm_upsert_json_named_mcp(const char *binary_path, const char *config
         case CBM_JSON_LIKE_OBJECT_MISSING:
             break;
         case CBM_JSON_LIKE_OBJECT_MISMATCH:
-            if (g_mcp_upsert_force) break; /* update: overwrite stale paths */
+            if (g_mcp_upsert_force)
+                break; /* update: overwrite stale paths */
             /* fall through: install rejects foreign entries */
         default:
             free(document);
