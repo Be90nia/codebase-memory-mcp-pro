@@ -946,18 +946,6 @@ int cbm_spawn_capture(const char *exe, const char *const *argv, char **out, size
     if (pid == 0) {
         /* Child: wire stdout to pipe write end, then execvp directly.
          * No shell, no AutoRun-equivalent on POSIX.
-         * ASAN does not fully support fork — mark the child as such to
-         * prevent DEADLYSIGNAL on _exit(). */
-#if defined(__SANITIZE_ADDRESS__)
-        /* Tell ASAN this is a forked child; use weak decl in case ASAN
-         * headers are not included. */
-        extern void __asan_on_before_fork(void) __attribute__((weak));
-        extern void __asan_on_after_fork(void) __attribute__((weak));
-        if (__asan_on_before_fork)
-            __asan_on_before_fork();
-        if (__asan_on_after_fork)
-            __asan_on_after_fork();
-#endif
         close(pipefd[0]);
         if (dup2(pipefd[1], STDOUT_FILENO) < 0) {
             _exit(127);

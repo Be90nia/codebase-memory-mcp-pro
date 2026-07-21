@@ -154,8 +154,7 @@ TEST(spawn_capture_missing_exe) {
 TEST(spawn_capture_validated_skips_pollution) {
     /* /usr/bin/printf emits two lines: simulate AutoRun banner + real output.
      * Validator must skip the banner and return only the TARGET line. */
-    const char *argv[] = {"/usr/bin/printf",
-                          "Active code page: 65001\nTARGET_real_output\n", NULL};
+    const char *argv[] = {"/usr/bin/printf", "Active code page: 65001\nTARGET_real_output\n", NULL};
     char *out = NULL;
     int rc =
         cbm_spawn_capture_validated("/usr/bin/printf", argv, &out, val_starts_with_target, NULL);
@@ -170,7 +169,8 @@ TEST(spawn_capture_validated_fails_loud_when_no_match) {
      * never fuzzy-extract the "least bad" line. This is the core contract. */
     const char *argv[] = {"/usr/bin/printf", "GARBAGE1\nGARBAGE2\n", NULL};
     char *out = NULL;
-    int rc = cbm_spawn_capture_validated("/usr/bin/printf", argv, &out, val_starts_with_target, NULL);
+    int rc =
+        cbm_spawn_capture_validated("/usr/bin/printf", argv, &out, val_starts_with_target, NULL);
     ASSERT_EQ(rc, CBM_NOT_FOUND);
     ASSERT_NULL(out);
     PASS();
@@ -188,10 +188,15 @@ SUITE(spawn_capture) {
     RUN_TEST(find_validated_line_null_safety);
     RUN_TEST(find_validated_line_empty_text);
 #ifndef _WIN32
+#if !defined(__SANITIZE_ADDRESS__)
+    /* ASAN does not support fork(): child process can trigger DEADLYSIGNAL.
+     * These integration tests use cbm_spawn_capture which calls fork+execvp.
+     * Skip under ASAN to avoid false failures. */
     RUN_TEST(spawn_capture_basic_echo);
     RUN_TEST(spawn_capture_exit_code);
     RUN_TEST(spawn_capture_missing_exe);
     RUN_TEST(spawn_capture_validated_skips_pollution);
     RUN_TEST(spawn_capture_validated_fails_loud_when_no_match);
+#endif
 #endif
 }
