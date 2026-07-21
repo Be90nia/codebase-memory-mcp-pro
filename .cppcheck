@@ -13,3 +13,7 @@ unusedFunction:tests/*
 constVariablePointer
 constParameterPointer
 constVariable
+
+# Cppcheck false positives (value-domain analysis gaps)
+uninitvar:src/mcp/mcp.c  # ids[] initialized in loop before use (line 9586-9590)
+knownConditionTrueFalse:src/mcp/mcp.c  # shown=min(count,6); count>shown is not always false

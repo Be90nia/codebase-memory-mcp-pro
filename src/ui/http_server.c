@@ -264,7 +264,7 @@ char *cbm_ui_git_web_base(const char *url) {
 
 /* Read the "origin" remote URL for the repo at root_path. malloc'd or NULL.
  *
- * libgit2 was removed from the build (license: GPLv2). We now spawn `git`
+ * libgit2 was removed from the build. We now spawn `git`
  * directly via cbm_spawn_capture (shell-free: argv array to CreateProcessW /
  * execvp; on Windows immune to cmd.exe AutoRun pollution, on POSIX no /bin/sh
  * quoting surface). Returns malloc'd NUL-terminated string, caller frees.
