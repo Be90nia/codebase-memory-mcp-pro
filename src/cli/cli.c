@@ -921,13 +921,13 @@ static int cbm_upsert_json_named_mcp(const char *binary_path, const char *config
         int ownership =
             cbm_json_mcp_snapshot_ownership(document, document_length, object_path, path_len,
                                             schema, entry_name, argument, binary_path);
-        /* MISMATCH means an entry exists with a different command (e.g. stale
-         * binary path from a previous install).  Upsert semantics require us to
-         * overwrite it — the ownership guard belongs in the remove path, not here. */
-        bool owned = ownership == CBM_JSON_LIKE_OBJECT_MATCH
-                   || ownership == CBM_JSON_LIKE_OBJECT_MISSING
-                   || ownership == CBM_JSON_LIKE_OBJECT_MISMATCH;
-        if (!owned) {
+        switch (ownership) {
+        case CBM_JSON_LIKE_OBJECT_MATCH:
+        case CBM_JSON_LIKE_OBJECT_MISSING:
+        /* MISMATCH: stale binary path from previous install; upsert must overwrite */
+        case CBM_JSON_LIKE_OBJECT_MISMATCH:
+            break;
+        default:
             free(document);
             return CLI_ERR;
         }
