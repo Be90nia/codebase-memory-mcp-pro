@@ -41,6 +41,8 @@ jobs:
   codeql-gate:
     runs-on: ubuntu-latest
     timeout-minutes: 240
+    # Skip on forks that don't have CodeQL enabled (avoids 45-min timeout).
+    if: github.event.repository.fork == false
     steps:
       - name: Wait for CodeQL on current commit (max 45 min)
         env:
