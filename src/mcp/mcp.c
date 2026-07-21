@@ -340,7 +340,8 @@ static const tool_def_t TOOLS[] = {
      "`query` is a space-separated bag of symbol/file names. Flags high-fan-in hotspots inline; "
      "for a precise sub-query use query_graph (openCypher).",
      "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":"
-     "\"Space-separated symbol/file names to explore (first 16)\"},\"project\":{\"type\":\"string\"},"
+     "\"Space-separated symbol/file names to explore (first "
+     "16)\"},\"project\":{\"type\":\"string\"},"
      "\"max_files\":{\"type\":\"integer\",\"description\":\"max source blocks (default 8)\"},"
      "\"depth\":{\"type\":\"integer\",\"description\":\"caller depth (default 1)\"},"
      "\"expand\":{\"type\":\"boolean\",\"description\":\"also list 1-hop neighbors — callees + "
@@ -1261,9 +1262,8 @@ char *cbm_mcp_get_string_arg(const char *args_json, const char *key) {
             for (size_t i = 0; i < n; i++) {
                 if (args_json[i] == '\\' && i + 1 < n) {
                     char next = args_json[i + 1];
-                    if (next == '"' || next == '\\' || next == '/' ||
-                        next == 'b' || next == 'f' || next == 'n' ||
-                        next == 'r' || next == 't' || next == 'u') {
+                    if (next == '"' || next == '\\' || next == '/' || next == 'b' || next == 'f' ||
+                        next == 'n' || next == 'r' || next == 't' || next == 'u') {
                         /* Already a legal JSON escape: copy both chars as-is. */
                         fixed[j++] = '\\';
                         fixed[j++] = next;
@@ -2399,7 +2399,8 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
         "       (fts.base_rank "
         "        - CASE WHEN n.label IN ('Function','Method') THEN 10.0 "
         "               WHEN n.label = 'Route' THEN 8.0 "
-        "               WHEN n.label IN ('Class','Interface','Type','Enum','Struct','Actor') THEN 5.0 "
+        "               WHEN n.label IN ('Class','Interface','Type','Enum','Struct','Actor') THEN "
+        "5.0 "
         "               ELSE 0.0 END) AS rank "
         "FROM ("
         "    SELECT rowid, bm25(nodes_fts) AS base_rank"
@@ -9670,8 +9671,9 @@ static char *handle_explore(cbm_mcp_server_t *srv, const char *args) {
                           neigh[i].label ? neigh[i].label : "?", neigh[i].via);
             }
             if (neigh_capped) {
-                expl_putf(&md, "> … +more omitted (showing first %d) — narrow the query or use "
-                               "`query_graph` for the full neighbor set.\n",
+                expl_putf(&md,
+                          "> … +more omitted (showing first %d) — narrow the query or use "
+                          "`query_graph` for the full neighbor set.\n",
                           EXPL_MAX_NEIGHBORS);
             }
         }
@@ -9718,8 +9720,10 @@ static char *handle_explore(cbm_mcp_server_t *srv, const char *args) {
         files_shown++;
     }
     if (seeds_capped) {
-        expl_putf(&md, "> Note: explored the first %d symbols only (cap reached) — pass fewer "
-                       "terms or split the query.\n", EXPL_MAX_SEEDS);
+        expl_putf(&md,
+                  "> Note: explored the first %d symbols only (cap reached) — pass fewer "
+                  "terms or split the query.\n",
+                  EXPL_MAX_SEEDS);
     }
     expl_put(&md, "---\n> For a precise sub-query (callers of X, call paths, custom filters) use "
                   "`query_graph` (openCypher). `⚠ hotspot` = high inbound fan-in.\n");

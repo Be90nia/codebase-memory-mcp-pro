@@ -55,8 +55,7 @@ int cbm_pclose(FILE *f);
  * failure. On success `*out` receives a malloc'd NUL-terminated buffer (caller
  * frees); on failure `*out` is set to NULL.
  */
-int cbm_spawn_capture(const char *exe, const char *const *argv,
-                      char **out, size_t *out_len);
+int cbm_spawn_capture(const char *exe, const char *const *argv, char **out, size_t *out_len);
 
 typedef bool (*cbm_line_validator_t)(const char *line, void *ctx);
 
@@ -81,8 +80,8 @@ bool cbm_validator_branch_name(const char *line, void *ctx);
  * matched line (trimmed of trailing \r\n) in `*out`; returns CBM_NOT_FOUND if
  * no line matches (and sets `*out` to NULL). Used by cbm_spawn_capture_validated
  * and unit-testable in isolation. */
-int cbm_find_validated_line(const char *text, cbm_line_validator_t validator,
-                            void *ctx, char **out);
+int cbm_find_validated_line(const char *text, cbm_line_validator_t validator, void *ctx,
+                            char **out);
 
 /* Spawn + capture + per-line validation. Each line of the child's stdout is
  * offered to `validator`; the first match is returned in `*out`. If no line
@@ -92,10 +91,8 @@ int cbm_find_validated_line(const char *text, cbm_line_validator_t validator,
  *
  * Pass NULL as `validator` to disable validation (returns the raw first line).
  */
-int cbm_spawn_capture_validated(const char *exe, const char *const *argv,
-                                char **out,
+int cbm_spawn_capture_validated(const char *exe, const char *const *argv, char **out,
                                 cbm_line_validator_t validator, void *ctx);
-
 
 /* Create directory (and parents). mode is ignored on Windows. Returns true on success. */
 bool cbm_mkdir_p(const char *path, int mode);

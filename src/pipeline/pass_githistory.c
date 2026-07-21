@@ -120,9 +120,15 @@ static int parse_git_log(const char *repo_path, commit_t **out, int *out_count) 
      * No validator needed — git log output is self-describing (COMMIT:<hash>:<ts>
      * markers + filenames), so non-conforming lines are naturally skipped below. */
     const char *argv[] = {
-        "git", "-C", repo_path, "--no-pager", "log", "--name-only",
+        "git",
+        "-C",
+        repo_path,
+        "--no-pager",
+        "log",
+        "--name-only",
         "--pretty=format:COMMIT:%H:%ct",
-        "--since=1 year ago", "--max-count=10000",
+        "--since=1 year ago",
+        "--max-count=10000",
         NULL,
     };
     char *raw = NULL;
@@ -178,7 +184,8 @@ static int parse_git_log(const char *repo_path, commit_t **out, int *out_count) 
             }
         }
 
-        if (!nl) break;
+        if (!nl)
+            break;
         p = nl + 1;
     }
 

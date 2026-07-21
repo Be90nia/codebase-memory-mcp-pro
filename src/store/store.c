@@ -193,8 +193,7 @@ static int exec_sql(cbm_store_t *s, const char *sql) {
             if (busy) {
                 char rc_buf[ST_BUF_16];
                 snprintf(rc_buf, sizeof(rc_buf), "%d", rc);
-                cbm_log_warn("store.busy_exhausted", "db_path", safe_str(s->db_path),
-                             "rc", rc_buf,
+                cbm_log_warn("store.busy_exhausted", "db_path", safe_str(s->db_path), "rc", rc_buf,
                              "hint", "concurrent reader/writer holds the lock too long");
             }
             sqlite3_free(err);
@@ -208,7 +207,6 @@ static int exec_sql(cbm_store_t *s, const char *sql) {
 
     return CBM_STORE_ERR;
 }
-
 
 /* Safe properties: returns "{}" if NULL. */
 static const char *safe_props(const char *s) {
@@ -6587,8 +6585,9 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
     char like[CBM_SZ_512];
     bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
     char nsqlbuf[ST_SQL_BUF];
-    const char *nbase = "SELECT id, name, qualified_name, file_path FROM nodes "
-                        "WHERE project=?1 AND label IN ('Function','Method','Class','Struct','Enum','Actor')";
+    const char *nbase =
+        "SELECT id, name, qualified_name, file_path FROM nodes "
+        "WHERE project=?1 AND label IN ('Function','Method','Class','Struct','Enum','Actor')";
     if (scoped) {
         snprintf(nsqlbuf, sizeof(nsqlbuf), "%s%s ORDER BY id LIMIT ?4", nbase,
                  arch_path_scope_sql());

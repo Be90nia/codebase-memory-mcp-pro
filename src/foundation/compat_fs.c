@@ -607,10 +607,11 @@ int cbm_exec_no_shell(const char *const *argv) {
     return (int)exit_code;
 }
 
-int cbm_spawn_capture(const char *exe, const char *const *argv,
-                      char **out, size_t *out_len) {
-    if (out) *out = NULL;
-    if (out_len) *out_len = 0;
+int cbm_spawn_capture(const char *exe, const char *const *argv, char **out, size_t *out_len) {
+    if (out)
+        *out = NULL;
+    if (out_len)
+        *out_len = 0;
     if (!exe || !argv || !argv[0] || !out) {
         return CBM_NOT_FOUND;
     }
@@ -644,23 +645,30 @@ int cbm_spawn_capture(const char *exe, const char *const *argv,
     wchar_t cmdline[CBM_SZ_8K];
     int pos = 0;
     for (int i = 0; argv[i]; i++) {
-        if (pos >= CBM_SZ_8K - 1) goto fail;
-        if (i > 0) cmdline[pos++] = L' ';
-        if (pos >= CBM_SZ_8K - 1) goto fail;
+        if (pos >= CBM_SZ_8K - 1)
+            goto fail;
+        if (i > 0)
+            cmdline[pos++] = L' ';
+        if (pos >= CBM_SZ_8K - 1)
+            goto fail;
         cmdline[pos++] = L'"';
         for (const char *p = argv[i]; *p; p++) {
             wchar_t wc_buf[2];
             int n = MultiByteToWideChar(CP_UTF8, 0, p, 1, wc_buf, 2);
-            if (n <= 0) continue;
+            if (n <= 0)
+                continue;
             wchar_t wc = wc_buf[0];
             if (wc == L'"' || wc == L'\\') {
-                if (pos >= CBM_SZ_8K - 2) goto fail;
+                if (pos >= CBM_SZ_8K - 2)
+                    goto fail;
                 cmdline[pos++] = L'\\';
             }
-            if (pos >= CBM_SZ_8K - 1) goto fail;
+            if (pos >= CBM_SZ_8K - 1)
+                goto fail;
             cmdline[pos++] = wc;
         }
-        if (pos >= CBM_SZ_8K - 1) goto fail;
+        if (pos >= CBM_SZ_8K - 1)
+            goto fail;
         cmdline[pos++] = L'"';
     }
     cmdline[pos] = L'\0';
@@ -673,8 +681,8 @@ int cbm_spawn_capture(const char *exe, const char *const *argv,
     si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
 
     PROCESS_INFORMATION pi = {0};
-    BOOL ok = CreateProcessW(lpApp, cmdline, NULL, NULL, TRUE,
-                             CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    BOOL ok =
+        CreateProcessW(lpApp, cmdline, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
     CloseHandle(pipe_w);
     if (!ok) {
         CloseHandle(pipe_r);
@@ -687,7 +695,8 @@ int cbm_spawn_capture(const char *exe, const char *const *argv,
     for (;;) {
         DWORD n = 0;
         BOOL rok = ReadFile(pipe_r, buf, sizeof(buf), &n, NULL);
-        if (n == 0) break;
+        if (n == 0)
+            break;
         char *np = (char *)realloc(result, total + n + 1);
         if (!np) {
             free(result);
@@ -699,7 +708,8 @@ int cbm_spawn_capture(const char *exe, const char *const *argv,
         memcpy(result + total, buf, n);
         total += n;
         result[total] = '\0';
-        if (!rok) break;
+        if (!rok)
+            break;
     }
     CloseHandle(pipe_r);
 
@@ -713,7 +723,8 @@ int cbm_spawn_capture(const char *exe, const char *const *argv,
         return CBM_NOT_FOUND;
     }
     *out = result;
-    if (out_len) *out_len = total;
+    if (out_len)
+        *out_len = total;
     return (int)exit_code;
 
 fail:
@@ -915,10 +926,11 @@ int cbm_exec_no_shell(const char *const *argv) {
     return CBM_NOT_FOUND; /* killed by signal */
 }
 
-int cbm_spawn_capture(const char *exe, const char *const *argv,
-                      char **out, size_t *out_len) {
-    if (out) *out = NULL;
-    if (out_len) *out_len = 0;
+int cbm_spawn_capture(const char *exe, const char *const *argv, char **out, size_t *out_len) {
+    if (out)
+        *out = NULL;
+    if (out_len)
+        *out_len = 0;
     if (!exe || !argv || !argv[0] || !out) {
         return CBM_NOT_FOUND;
     }
@@ -954,7 +966,8 @@ int cbm_spawn_capture(const char *exe, const char *const *argv,
     char *result = NULL;
     for (;;) {
         ssize_t n = read(pipefd[0], buf, sizeof(buf));
-        if (n <= 0) break;
+        if (n <= 0)
+            break;
         char *np = (char *)realloc(result, total + (size_t)n + 1);
         if (!np) {
             free(result);
@@ -979,7 +992,8 @@ int cbm_spawn_capture(const char *exe, const char *const *argv,
         return CBM_NOT_FOUND;
     }
     *out = result;
-    if (out_len) *out_len = total;
+    if (out_len)
+        *out_len = total;
 
     if (WIFEXITED(status)) {
         return WEXITSTATUS(status);
@@ -1114,8 +1128,7 @@ bool cbm_validator_git_path(const char *line, void *ctx) {
         return true;
     }
 #ifdef _WIN32
-    if (isalpha((unsigned char)line[0]) && line[1] == ':' &&
-        (line[2] == '\\' || line[2] == '/')) {
+    if (isalpha((unsigned char)line[0]) && line[1] == ':' && (line[2] == '\\' || line[2] == '/')) {
         return true;
     }
     if (line[0] == '\\' || line[0] == '/') {
@@ -1136,18 +1149,18 @@ bool cbm_validator_branch_name(const char *line, void *ctx) {
     }
     /* Branch names never contain spaces, tabs, or git ref meta-characters. */
     for (const char *p = line; *p; p++) {
-        if (*p == ' ' || *p == '\t' || *p == ':' || *p == '?' || *p == '*' ||
-            *p == '[' || *p == '\\' || *p == '~' || *p == '^') {
+        if (*p == ' ' || *p == '\t' || *p == ':' || *p == '?' || *p == '*' || *p == '[' ||
+            *p == '\\' || *p == '~' || *p == '^') {
             return false;
         }
     }
     return true;
 }
 
-
-int cbm_find_validated_line(const char *text, cbm_line_validator_t validator,
-                            void *ctx, char **out) {
-    if (out) *out = NULL;
+int cbm_find_validated_line(const char *text, cbm_line_validator_t validator, void *ctx,
+                            char **out) {
+    if (out)
+        *out = NULL;
     if (!text || !validator || !out) {
         return CBM_NOT_FOUND;
     }
@@ -1172,23 +1185,25 @@ int cbm_find_validated_line(const char *text, cbm_line_validator_t validator,
 
         if (validator(tmp, ctx)) {
             char *dup = (char *)malloc(strlen(tmp) + 1);
-            if (!dup) return CBM_NOT_FOUND;
+            if (!dup)
+                return CBM_NOT_FOUND;
             strcpy(dup, tmp);
             *out = dup;
             return 0;
         }
 
-        if (!line_end) break;
+        if (!line_end)
+            break;
         line_start = line_end + 1;
     }
 
     return CBM_NOT_FOUND;
 }
 
-int cbm_spawn_capture_validated(const char *exe, const char *const *argv,
-                                char **out,
+int cbm_spawn_capture_validated(const char *exe, const char *const *argv, char **out,
                                 cbm_line_validator_t validator, void *ctx) {
-    if (out) *out = NULL;
+    if (out)
+        *out = NULL;
     if (!exe || !argv || !out) {
         return CBM_NOT_FOUND;
     }
@@ -1225,12 +1240,11 @@ int cbm_spawn_capture_validated(const char *exe, const char *const *argv,
 
         size_t lines = 1;
         for (size_t j = 0; j < raw_len; j++) {
-            if (raw[j] == '\n') lines++;
+            if (raw[j] == '\n')
+                lines++;
         }
-        cbm_log_warn("spawn.validation_failed",
-                     "exe", exe,
-                     "first_line", first_line,
-                     "total_lines", (int)lines);
+        cbm_log_warn("spawn.validation_failed", "exe", exe, "first_line", first_line, "total_lines",
+                     (int)lines);
         free(raw);
         return CBM_NOT_FOUND;
     }

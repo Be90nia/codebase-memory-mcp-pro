@@ -6337,7 +6337,8 @@ static void push_class_body_children(TSNode node, const CBMLangSpec *spec, wd_st
             // containers extract_class_def already extracts members from (it finds them via the
             // "body" field, which this child-type scan doesn't). Route them through the
             // nested-class path here too, so enum statics / protocol members aren't ALSO
-            // re-walked and emitted as top-level Functions (the Method/Function dup-node bug, WS2a).
+            // re-walked and emitted as top-level Functions (the Method/Function dup-node bug,
+            // WS2a).
             strcmp(ck, "enum_class_body") == 0 || strcmp(ck, "protocol_body") == 0 ||
             strcmp(ck, "declaration_list") == 0 || strcmp(ck, "body") == 0 ||
             strcmp(ck, "block") == 0 || strcmp(ck, "suite") == 0 ||
