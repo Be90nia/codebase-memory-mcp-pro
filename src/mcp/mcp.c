@@ -9033,6 +9033,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
             yyjson_mut_arr_add_strcpy(doc, cf, files[i]);
         }
         yyjson_mut_obj_add_val(doc, root_obj, "changed_files", cf);
+        yyjson_mut_obj_add_int(doc, root_obj, "depth", depth);
         yyjson_mut_obj_add_int(doc, root_obj, "seed_symbols", seed_count);
         yyjson_mut_obj_add_int(doc, root_obj, "impacted_total", impact.visited_count);
         int imp_shown = impact.visited_count < imp_limit ? impact.visited_count : imp_limit;

@@ -719,10 +719,7 @@ int cbm_spawn_capture(const char *exe, const char *const *argv, char **out, size
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
 
-    if (!result) {
-        return CBM_NOT_FOUND;
-    }
-    *out = result;
+    *out = result; /* NULL when child produced no output; caller initialized *out=NULL above */
     if (out_len)
         *out_len = total;
     return (int)exit_code;
@@ -988,16 +985,18 @@ int cbm_spawn_capture(const char *exe, const char *const *argv, char **out, size
         return CBM_NOT_FOUND;
     }
 
-    if (!result) {
-        return CBM_NOT_FOUND;
-    }
-    *out = result;
+    *out = result; /* NULL when child produced no output; caller initialized *out=NULL above */
     if (out_len)
         *out_len = total;
 
+
     if (WIFEXITED(status)) {
+        /* Return exit code even when child produced no output.
+         * Out is NULL but caller gets the real exit code (e.g. /bin/false → 1).
+         * ponytail: out==NULL on empty stdout is fine; caller checks rc first. */
         return WEXITSTATUS(status);
     }
+    free(result);
     return CBM_NOT_FOUND; /* killed by signal */
 }
 
