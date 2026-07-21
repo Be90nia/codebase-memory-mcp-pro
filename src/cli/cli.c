@@ -935,15 +935,16 @@ static int cbm_upsert_json_named_mcp(const char *binary_path, const char *config
         case CBM_JSON_LIKE_OBJECT_MISSING:
             break;
         case CBM_JSON_LIKE_OBJECT_MISMATCH:
-            if (g_mcp_upsert_force)
+            if (g_mcp_upsert_force) {
                 break; /* update: overwrite stale paths */
-            /* fall through: install rejects foreign entries */
+            }
+            free(document);
+            return CLI_ERR;
         default:
             free(document);
             return CLI_ERR;
         }
     }
-
     char *entry = cbm_build_json_mcp_entry(binary_path, schema, argument);
     if (!entry) {
         free(document);
