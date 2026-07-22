@@ -330,6 +330,7 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
 
       - name: Publish to npm
+        continue-on-error: true
         working-directory: pkg/npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -351,6 +352,7 @@ jobs:
           python -m build
 
       - name: Publish to PyPI
+        continue-on-error: true
         working-directory: pkg/pypi
         env:
           TWINE_USERNAME: __token__
