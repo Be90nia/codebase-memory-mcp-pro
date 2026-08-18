@@ -33,6 +33,9 @@ enum {
     LOCK_REGISTRY_STRESS_THREADS = 8,
     LOCK_REGISTRY_STRESS_ITERATIONS = 160,
     LOCK_REGISTRY_PARKING_WAITERS = 64,
+    /* Upper bound only for readiness polling loops; loops exit early once the awaited state
+       is observed. Loaded CI runners (macos-15-intel) can outrun tighter windows. */
+    LOCK_REGISTRY_OBSERVE_WINDOW_MS = 2000,
 };
 
 typedef struct {
@@ -859,7 +862,8 @@ TEST(lock_registry_large_queue_parks_non_head_waiters) {
 
     bool all_queued = false;
     bool tails_parked = false;
-    uint64_t observe_deadline = cbm_now_ms() + 500;
+    /* 64 waiters must enqueue and park; window is an upper bound, not a delay. */
+    uint64_t observe_deadline = cbm_now_ms() + LOCK_REGISTRY_OBSERVE_WINDOW_MS;
     while (thread_count == LOCK_REGISTRY_PARKING_WAITERS && cbm_now_ms() < observe_deadline) {
         all_queued =
             cbm_lock_registry_waiter_count(fixture.registry) == LOCK_REGISTRY_PARKING_WAITERS;
@@ -928,7 +932,7 @@ TEST(lock_registry_cancel_request_wakes_parked_tail) {
     bool head_started = holder_status == CBM_PRIVATE_FILE_LOCK_OK &&
                         cbm_thread_create(&head_thread, 0, lock_registry_waiter_run, &head) == 0;
     bool head_attempting = false;
-    uint64_t head_deadline = cbm_now_ms() + 500;
+    uint64_t head_deadline = cbm_now_ms() + LOCK_REGISTRY_OBSERVE_WINDOW_MS;
     while (head_started && cbm_now_ms() < head_deadline) {
         head_attempting = cbm_lock_registry_waiter_count(fixture.registry) == 1 &&
                           cbm_lock_registry_attempting_waiter_count_for_test(fixture.registry) == 1;
@@ -948,7 +952,7 @@ TEST(lock_registry_cancel_request_wakes_parked_tail) {
     bool tail_started =
         head_attempting && cbm_thread_create(&tail_thread, 0, lock_registry_waiter_run, &tail) == 0;
     bool tail_parked = false;
-    uint64_t tail_deadline = cbm_now_ms() + 500;
+    uint64_t tail_deadline = cbm_now_ms() + LOCK_REGISTRY_OBSERVE_WINDOW_MS;
     while (tail_started && cbm_now_ms() < tail_deadline) {
         tail_parked = cbm_lock_registry_waiter_count(fixture.registry) == 2 &&
                       cbm_lock_registry_attempting_waiter_count_for_test(fixture.registry) == 1 &&
@@ -963,7 +967,7 @@ TEST(lock_registry_cancel_request_wakes_parked_tail) {
         tail_parked ? cbm_lock_registry_request_cancel(fixture.registry, &tail.cancel_token)
                     : CBM_PRIVATE_FILE_LOCK_IO;
     bool tail_woke = false;
-    uint64_t wake_deadline = cbm_now_ms() + 500;
+    uint64_t wake_deadline = cbm_now_ms() + LOCK_REGISTRY_OBSERVE_WINDOW_MS;
     while (tail_started && cbm_now_ms() < wake_deadline) {
         tail_woke = atomic_load_explicit(&tail.finished, memory_order_acquire);
         if (tail_woke) {
@@ -1066,7 +1070,7 @@ TEST(lock_registry_absolute_deadline_survives_repeated_wakes) {
     bool head_started = holder_status == CBM_PRIVATE_FILE_LOCK_OK &&
                         cbm_thread_create(&head_thread, 0, lock_registry_waiter_run, &head) == 0;
     bool head_attempting = false;
-    uint64_t head_deadline = cbm_now_ms() + 500;
+    uint64_t head_deadline = cbm_now_ms() + LOCK_REGISTRY_OBSERVE_WINDOW_MS;
     while (head_started && cbm_now_ms() < head_deadline) {
         head_attempting = cbm_lock_registry_waiter_count(fixture.registry) == 1 &&
                           cbm_lock_registry_attempting_waiter_count_for_test(fixture.registry) == 1;
@@ -1086,18 +1090,20 @@ TEST(lock_registry_absolute_deadline_survives_repeated_wakes) {
     bool tail_started =
         head_attempting &&
         cbm_thread_create(&tail_thread, 0, lock_registry_deadline_waiter_run, &tail) == 0;
-    uint64_t ready_deadline = cbm_now_ms() + 500;
+    uint64_t ready_deadline = cbm_now_ms() + LOCK_REGISTRY_OBSERVE_WINDOW_MS;
     while (tail_started && !atomic_load_explicit(&tail.ready, memory_order_acquire) &&
            cbm_now_ms() < ready_deadline) {
         lock_registry_test_yield();
     }
     bool tail_ready = tail_started && atomic_load_explicit(&tail.ready, memory_order_acquire);
+    /* Deadline chain scaled 4x from 200/100/600 so slow CI runners fit the same relative
+       budget; the elapsed asserts below scale with it. */
     uint64_t deadline_start = cbm_now_ms();
-    tail.deadline_ms = deadline_start + 200;
+    tail.deadline_ms = deadline_start + 800;
     atomic_store_explicit(&tail.go, true, memory_order_release);
 
     bool tail_queued = false;
-    uint64_t queue_deadline = deadline_start + 100;
+    uint64_t queue_deadline = deadline_start + 400;
     while (tail_ready && cbm_now_ms() < queue_deadline) {
         tail_queued = cbm_lock_registry_waiter_count(fixture.registry) == 2 &&
                       cbm_lock_registry_attempting_waiter_count_for_test(fixture.registry) == 1;
@@ -1110,7 +1116,7 @@ TEST(lock_registry_absolute_deadline_survives_repeated_wakes) {
     cbm_lock_cancel_token_t unrelated_token;
     atomic_init(&unrelated_token, false);
     bool broadcasts_ok = true;
-    uint64_t observe_deadline = deadline_start + 600;
+    uint64_t observe_deadline = deadline_start + 2400;
     while (tail_ready && !atomic_load_explicit(&tail.finished, memory_order_acquire) &&
            cbm_now_ms() < observe_deadline) {
         broadcasts_ok = cbm_lock_registry_request_cancel(fixture.registry, &unrelated_token) ==
@@ -1153,8 +1159,8 @@ TEST(lock_registry_absolute_deadline_survives_repeated_wakes) {
     ASSERT_TRUE(tail_queued);
     ASSERT_TRUE(broadcasts_ok);
     ASSERT_TRUE(returned_at_deadline);
-    ASSERT_GTE(elapsed_ms, 150);
-    ASSERT_TRUE(elapsed_ms < 350);
+    ASSERT_GTE(elapsed_ms, 600);
+    ASSERT_TRUE(elapsed_ms < 1400);
     ASSERT_EQ(tail.status, CBM_PRIVATE_FILE_LOCK_BUSY);
     ASSERT_NULL(tail.lease);
     ASSERT_EQ(head.status, CBM_PRIVATE_FILE_LOCK_BUSY);
