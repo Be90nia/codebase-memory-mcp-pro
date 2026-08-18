@@ -39,6 +39,11 @@ typedef void (*cbm_activation_transaction_before_absent_publish_for_test_fn)(
 void cbm_activation_transaction_set_before_absent_publish_for_test(
     cbm_activation_transaction_before_absent_publish_for_test_fn hook, void *context);
 
+/* Test-only seam: make the next `count` Windows rename attempts fail as though
+ * another handle held the file, so the transient-lock retry can be proven
+ * without racing a real scanner. Inert on POSIX and when count is 0. */
+void cbm_activation_transaction_rename_failures_set_for_test(unsigned int count);
+
 /* Stage a candidate beside target_path (therefore on the same filesystem).
  * The staged file is private to the current account and executable. */
 cbm_activation_transaction_status_t cbm_activation_transaction_stage_bytes(
@@ -91,5 +96,10 @@ const char *cbm_activation_transaction_status_message(cbm_activation_transaction
  * way a caller can say WHY staging failed. Reset by every prepare/stage
  * entry; single-threaded like the rest of the transaction API. */
 const char *cbm_activation_transaction_refusal_note(void);
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_activation_transaction_note_refusal_for_testing(const char *predicate,
+                                                         unsigned long os_error);
+#endif
 
 #endif /* CBM_ACTIVATION_TRANSACTION_H */

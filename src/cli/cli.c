@@ -11,8 +11,8 @@
 #include "cli/config_json_like.h"
 #include "cli/config_text_edit.h"
 #include "cli/config_toml_edit.h"
+#include "ui/config.h"
 #include "cli/config_yaml_edit.h"
-#include "cli/windows_launcher_state.h"
 #include "daemon/bootstrap.h"
 #include "daemon/ipc.h"
 #include "daemon/runtime.h"
@@ -22,6 +22,7 @@
 #include "foundation/constants.h"
 #include "foundation/log.h"
 #include "foundation/sha256.h"
+#include "cli/client_adapter.h"
 #include "mcp/mcp.h" // cbm_mcp_tool_input_schema — CLI flag parser + per-tool --help
 #include "mcp/index_supervisor.h"
 
@@ -72,8 +73,6 @@ enum {
     MIN_ARGC_GET = 2,
     AUTO_YES = 1,
     AUTO_NO = -1,
-    VARIANT_A = 1,
-    VARIANT_B = 2,
     OCTAL_BASE = 8,
     CLI_ACTIVATION_DRAIN_TIMEOUT_MS = 15000,
     CLI_ACTIVATION_CONTROL_TIMEOUT_MS = 2000,
@@ -108,6 +107,10 @@ static int cbm_powershell_quote_word(const char *value, char *out, size_t out_si
 #include <stdlib.h>
 #include <string.h>   // strtok_r
 #include <sys/stat.h> // mode_t, S_IXUSR
+#ifdef __FreeBSD__
+#include <sys/types.h>
+#include <sys/sysctl.h>
+#endif
 #include <time.h>
 #include <wchar.h>
 #include <zlib.h> // MAX_WBITS
@@ -154,9 +157,31 @@ int cbm_cli_exit_status_after_maintenance(int exit_status, bool maintenance_canc
     return maintenance_cancelled && exit_status == EXIT_SUCCESS ? EXIT_FAILURE : exit_status;
 }
 
-static const char CLI_ACTIVATION_REFUSED_MESSAGE[] =
+/* #1537. Two very different failures reached this one message: the cohort was
+ * BUSY (real sessions are running — the reader can close them), or the
+ * reservation failed outright (lock I/O, stale coordination state, permissions
+ * — nothing the reader can close, because nothing is running). Reporting both
+ * as "active sessions" sent someone hunting processes that a reboot proved did
+ * not exist.
+ *
+ * The remedy line must also survive the situation it prints in: an install or
+ * a retry after `uninstall` has no cbm on PATH, so "run codebase-memory-mcp
+ * daemon status" was advice the reader could not follow at exactly the moment
+ * they needed it. Each message now names its own condition and stays runnable. */
+static const char CLI_ACTIVATION_BUSY_MESSAGE[] =
     "error: active CBM sessions and operations could not be stopped safely; "
-    "no activation was committed.";
+    "no activation was committed.\n"
+    "error: something is still using CBM. If an editor or agent is running an "
+    "MCP server, close it and retry; 'codebase-memory-mcp daemon status' lists "
+    "the holders when a cbm binary is still installed.";
+static const char CLI_ACTIVATION_REFUSED_MESSAGE[] =
+    "error: activation could not reserve exclusive access; no activation was "
+    "committed.\n"
+    "error: this is NOT a running-session problem — the reservation itself "
+    "failed (coordination lock, leftover state, or permissions). Nothing needs "
+    "to be closed. Check the errors above, and report this with the output of "
+    "'ls -la \"${CBM_CACHE_DIR:-$HOME/.cache/codebase-memory-mcp}\"' if it "
+    "persists.";
 static const char CLI_ACTIVATION_PARTIAL_MESSAGE[] =
     "error: activation stopped after one or more agent configuration or "
     "cleanup operations failed; the published/current executable was kept, "
@@ -195,173 +220,47 @@ static cbm_cli_activation_ops_t g_cli_activation_test_ops;
 static bool g_cli_activation_test_ops_set = false;
 static const char *g_cli_activation_runtime_parent_for_test = NULL;
 
-#ifdef _WIN32
-static cbm_windows_launcher_context_t g_windows_launcher_context;
-static bool cli_windows_current_path(const wchar_t *canonical_launcher,
-                                     wchar_t out[CBM_WINDOWS_LAUNCHER_PATH_CAP]);
-static bool cli_windows_read_current(const wchar_t *canonical_launcher,
-                                     cbm_windows_current_v1_t *state_out, bool *exists_out);
-static bool cli_windows_canonicalize_launcher_path(wchar_t path[CBM_WINDOWS_LAUNCHER_PATH_CAP]);
-
-static bool cli_windows_current_process_size(uint64_t *size_out) {
-    if (!size_out) {
-        return false;
-    }
-    wchar_t path[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    DWORD length = GetModuleFileNameW(NULL, path, (DWORD)(sizeof(path) / sizeof(path[0])));
-    if (length == 0 || length >= (DWORD)(sizeof(path) / sizeof(path[0]))) {
-        return false;
-    }
-    WIN32_FILE_ATTRIBUTE_DATA attributes;
-    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &attributes)) {
-        return false;
-    }
-    *size_out = ((uint64_t)attributes.nFileSizeHigh << 32U) | (uint64_t)attributes.nFileSizeLow;
-    return *size_out > 0;
-}
-
-int cbm_cli_windows_payload_descriptor_role(int argc, char *const argv[]) {
-    static const char role[] = "__cbm_windows_payload_descriptor_v1";
-    if (argc != 3 || !argv || !argv[1] || strcmp(argv[1], role) != 0) {
-        return -1;
-    }
-    if (!argv[2] || !argv[2][0])
-        return CLI_TRUE;
-    uint64_t launcher_abi = 0U;
-    for (const char *cursor = argv[2]; *cursor; cursor++) {
-        if (*cursor < '0' || *cursor > '9' ||
-            launcher_abi > (UINT32_MAX - (uint64_t)(*cursor - '0')) / 10U) {
-            return CLI_TRUE;
-        }
-        launcher_abi = launcher_abi * 10U + (uint64_t)(*cursor - '0');
-    }
-    uint64_t payload_size = 0U;
-    bool fingerprint_ready = launcher_abi > 0U && cbm_index_supervisor_capture_build_fingerprint();
-    const char *fingerprint = fingerprint_ready ? cbm_index_supervisor_build_fingerprint() : NULL;
-    cbm_windows_release_descriptor_v1_t descriptor = {
-        .launcher_abi = (uint32_t)launcher_abi,
-        .payload_launcher_abi_min = CBM_WINDOWS_PAYLOAD_LAUNCHER_ABI_MIN,
-        .payload_launcher_abi_max = CBM_WINDOWS_PAYLOAD_LAUNCHER_ABI_MAX,
-    };
-    descriptor.payload_size = cli_windows_current_process_size(&payload_size) ? payload_size : 0U;
-    if (fingerprint) {
-        (void)snprintf(descriptor.payload_sha256, sizeof(descriptor.payload_sha256), "%s",
-                       fingerprint);
-    }
-    uint8_t record[CBM_WINDOWS_RELEASE_DESCRIPTOR_V1_SIZE];
-    /* stdout is a pipe for this private binary protocol, but the Windows CRT
-     * still defaults it to text mode.  A 0x0a byte in payload_size must remain
-     * one byte rather than being expanded to CRLF. */
-    bool binary_stdout = _setmode(_fileno(stdout), _O_BINARY) != -1;
-    bool descriptor_written =
-        binary_stdout && cbm_windows_release_descriptor_v1_encode(&descriptor, record) &&
-        fwrite(record, 1U, sizeof(record), stdout) == sizeof(record) && fflush(stdout) == 0;
-    return descriptor_written ? CLI_OK : CLI_TRUE;
-}
-
-int cbm_cli_windows_launcher_startup_authenticate(int argc, char *const argv[]) {
-    cbm_windows_launcher_context_t context;
-    char error[CLI_BUF_512] = {0};
-    if (!cbm_windows_launcher_context_consume(&context, error, sizeof(error))) {
-        (void)fprintf(stderr, "codebase-memory-mcp: untrusted Windows launcher context: %s\n",
-                      error[0] ? error : "authentication failed");
-        return CLI_TRUE;
-    }
-
-    cbm_windows_launcher_action_t action =
-        cbm_windows_launcher_classify_action(argc, (const char *const *)argv);
-    if (context.present && context.action != action) {
-        (void)cbm_windows_launcher_context_complete(&context, false, error, sizeof(error));
-        (void)fprintf(stderr, "codebase-memory-mcp: Windows launcher action did not match the "
-                              "payload command\n");
-        return CLI_TRUE;
-    }
-    if (!context.present) {
-        if (!cbm_windows_launcher_context_complete(&context, true, error, sizeof(error))) {
-            (void)fprintf(stderr,
-                          "codebase-memory-mcp: Windows launcher completion failed: "
-                          "%s\n",
-                          error[0] ? error : "authority acknowledgement failed");
-            return CLI_TRUE;
-        }
-        memset(&g_windows_launcher_context, 0, sizeof(g_windows_launcher_context));
-        return CLI_OK;
-    }
-
-    bool mutation = action == CBM_WINDOWS_LAUNCHER_ACTION_UPDATE ||
-                    action == CBM_WINDOWS_LAUNCHER_ACTION_UNINSTALL;
-    if (!cbm_windows_launcher_action_allowed(action, context.managed) ||
-        context.private_activation != mutation) {
-        (void)cbm_windows_launcher_context_complete(&context, false, error, sizeof(error));
-        (void)fprintf(stderr, "codebase-memory-mcp: Windows launcher refused an invalid "
-                              "managed activation context\n");
-        return CLI_TRUE;
-    }
-
-    if (context.managed) {
-        uint64_t process_size = 0;
-        bool fingerprint_ok = cbm_index_supervisor_capture_build_fingerprint();
-        const char *fingerprint = fingerprint_ok ? cbm_index_supervisor_build_fingerprint() : NULL;
-        if (!fingerprint || context.payload_size == 0 ||
-            !cli_windows_current_process_size(&process_size) ||
-            process_size != context.payload_size ||
-            strcmp(fingerprint, context.expected_payload_sha256) != 0 ||
-            context.canonical_launcher_path[0] == L'\0') {
-            (void)cbm_windows_launcher_context_complete(&context, false, error, sizeof(error));
-            (void)fprintf(stderr, "codebase-memory-mcp: managed Windows payload identity did "
-                                  "not match current-v1; startup refused\n");
-            return CLI_TRUE;
-        }
-    }
-
-    if (!cbm_windows_launcher_context_complete(&context, true, error, sizeof(error))) {
-        (void)fprintf(stderr, "codebase-memory-mcp: Windows launcher completion failed: %s\n",
-                      error[0] ? error : "authority acknowledgement failed");
-        return CLI_TRUE;
-    }
-    if (context.canonical_launcher_path[0] != L'\0' &&
-        !cli_windows_canonicalize_launcher_path(context.canonical_launcher_path)) {
-        (void)cbm_windows_launcher_context_complete(&context, false, error, sizeof(error));
-        (void)fprintf(stderr, "codebase-memory-mcp: managed Windows launcher path could not "
-                              "be canonicalized; startup refused\n");
-        return CLI_TRUE;
-    }
-    g_windows_launcher_context = context;
-    return CLI_OK;
-}
-
-static bool cli_windows_require_managed_mutation(cbm_windows_launcher_action_t action) {
-    if (g_windows_launcher_context.present && g_windows_launcher_context.managed &&
-        g_windows_launcher_context.private_activation &&
-        g_windows_launcher_context.action == action) {
-        return true;
-    }
-    const char *operation =
-        action == CBM_WINDOWS_LAUNCHER_ACTION_UNINSTALL ? "uninstall" : "update";
-    (void)fprintf(stderr,
-                  "error: portable Windows payloads cannot self-%s. Use your package "
-                  "manager to replace/remove this portable copy, or run "
-                  "\"codebase-memory-mcp.payload.exe install\" once to create a "
-                  "managed launcher installation.\n",
-                  operation);
-    return false;
-}
-#else
-int cbm_cli_windows_payload_descriptor_role(int argc, char *const argv[]) {
-    (void)argc;
-    (void)argv;
-    return -1;
-}
-
-int cbm_cli_windows_launcher_startup_authenticate(int argc, char *const argv[]) {
-    (void)argc;
-    (void)argv;
-    return CLI_OK;
-}
-#endif
-
 static void cli_activation_diagnostic(const cbm_cli_activation_ops_t *ops, const char *message) {
     const char *diagnostic = message ? message : CLI_ACTIVATION_REFUSED_MESSAGE;
+    /* #1416: when the transaction recorded a concrete refusal (an ACL or
+     * filesystem safety check), say THAT. The generic text blames "active CBM
+     * sessions" for what is a validation refusal - reporters rebooted, killed
+     * every process, and hunted phantom handles because the message pointed at
+     * sessions that did not exist. The sessions wording remains for genuine
+     * stop/reservation failures, which record no refusal note. */
+    char attributed[CBM_SZ_1K];
+    const char *note = cbm_activation_transaction_refusal_note();
+    /* A recorded refusal is more specific than EITHER generic message, so it
+     * wins over both the busy and the reservation-failure wording. */
+    if ((diagnostic == CLI_ACTIVATION_REFUSED_MESSAGE ||
+         diagnostic == CLI_ACTIVATION_BUSY_MESSAGE) &&
+        note && note[0]) {
+        (void)snprintf(attributed, sizeof(attributed),
+                       "error: activation was refused by a filesystem safety check before any "
+                       "change was made: %s\n"
+                       "error: this is not a session problem. If the flagged directory is one you "
+                       "trust, remove the flagged permission grant (icacls <dir> /remove:g <sid>) "
+                       "or use an owner-private directory for --dir/CBM_CACHE_DIR, then retry.",
+                       note);
+        diagnostic = attributed;
+    } else if (diagnostic == CLI_ACTIVATION_REFUSED_MESSAGE) {
+        /* #1537/#1416: the reservation-failure message told the reader to
+         * "check the errors above" — and nothing was above. The detail that
+         * names the failing component is recorded on the daemon side and was
+         * only ever surfaced by `daemon status`, so the CLI replaced a message
+         * that blamed the wrong thing with one that blamed nothing. Two
+         * reporters were left with no way forward. Print it here. */
+        const char *detail = cbm_daemon_ipc_validation_detail();
+        if (detail && detail[0]) {
+            (void)snprintf(attributed, sizeof(attributed),
+                           "error: activation could not reserve exclusive access; no activation "
+                           "was committed.\n"
+                           "error: this is NOT a running-session problem — nothing needs to be "
+                           "closed. The check that refused was: %s",
+                           detail);
+            diagnostic = attributed;
+        }
+    }
     if (ops && ops->visible_diagnostic) {
         ops->visible_diagnostic(ops->context, diagnostic);
         return;
@@ -386,7 +285,12 @@ int cbm_cli_activation_guard_with_ops(const cbm_cli_activation_ops_t *ops,
         if (mutation_lease) {
             ops->mutation_lease_release(ops->context, mutation_lease);
         }
-        cli_activation_diagnostic(ops, CLI_ACTIVATION_REFUSED_MESSAGE);
+        /* 0 means the cohort was BUSY: real sessions hold it and closing them
+         * is the remedy. Anything else is the reservation itself failing, and
+         * telling that reader to close sessions sends them after processes
+         * that do not exist (#1537). */
+        cli_activation_diagnostic(ops, reserve_status == 0 ? CLI_ACTIVATION_BUSY_MESSAGE
+                                                           : CLI_ACTIVATION_REFUSED_MESSAGE);
         return CLI_TRUE;
     }
 
@@ -763,10 +667,9 @@ static bool cli_activation_production_context_init(cli_activation_production_con
                                       captured_build) > 0
                            : cbm_daemon_runtime_process_build_fingerprint(
                                  cli_activation_process_id(), context->source_build);
-    /* Managed update/uninstall payload copies are POSIX-unlinked immediately
-     * after the authenticated startup handshake. Their process image can no
-     * longer be reopened by pathname here, so reuse the exact fingerprint
-     * captured and checked before that unlink. */
+    /* An update/uninstall may already have unlinked or replaced the running
+     * image by the time we get here, so its process image can no longer be
+     * reopened by pathname: reuse the exact fingerprint captured earlier. */
     if (!context->endpoint || !context->cohort_manager || !build_ready) {
         return false;
     }
@@ -1205,7 +1108,6 @@ void cbm_cli_set_activation_cleanup_failure_for_test(bool enabled);
 int cbm_cli_activation_abort_cleanup_probe_for_test(void);
 #endif
 
-#if !defined(_WIN32) || defined(CBM_CLI_ENABLE_TEST_API)
 static void cli_activation_transaction_abort_or_fail_stop(
     cbm_activation_transaction_t **transaction_io, const char *component) {
     int cleanup_status = cli_activation_transaction_abort(transaction_io);
@@ -1219,7 +1121,6 @@ static void cli_activation_transaction_abort_or_fail_stop(
                                          component ? component : "activation_transaction_cleanup");
     }
 }
-#endif
 
 #ifdef CBM_CLI_ENABLE_TEST_API
 void cbm_cli_set_activation_cleanup_failure_for_test(bool enabled) {
@@ -1280,7 +1181,6 @@ static int cli_activation_transaction_finalize_close(
     return cli_activation_transaction_abort(transaction_io);
 }
 
-#if !defined(_WIN32) || defined(CBM_CLI_ENABLE_TEST_API)
 static void cli_activation_transaction_finalize_committed_or_fail_stop(
     cbm_activation_transaction_t **transaction_io, const char *component) {
     if (!transaction_io || !*transaction_io) {
@@ -1313,7 +1213,6 @@ static int cli_activation_transaction_commit_removal(cbm_activation_transaction_
                ? CLI_OK
                : CLI_ERR;
 }
-#endif
 
 static bool cli_activation_transaction_expected_build(cbm_activation_transaction_t *transaction,
                                                       cli_binary_validator_t *validator) {
@@ -1378,12 +1277,17 @@ int cbm_replace_binary(const char *path, const unsigned char *data, int len, int
 static const char skill_content[] =
     "---\n"
     "name: codebase-memory\n"
-    "description: Use the codebase knowledge graph for structural code queries. "
+    /* #1554: the value contains "Triggers on: " — a colon-space, which YAML
+     * reads as a nested-mapping indicator inside an unquoted scalar. Strict
+     * parsers (js-yaml's load, the frontmatter reader in `npx skills`) reject
+     * the whole file, so the skill silently fails to load rather than loading
+     * wrongly. Quoting the scalar is the fix; the text itself is unchanged. */
+    "description: \"Use the codebase knowledge graph for structural code queries. "
     "Triggers on: explore the codebase, understand the architecture, what functions exist, "
     "show me the structure, who calls this function, what does X call, trace the call chain, "
     "find callers of, show dependencies, impact analysis, dead code, unused functions, "
     "high fan-out, refactor candidates, code quality audit, graph query syntax, "
-    "Cypher query examples, edge types, how to use search_graph.\n"
+    "Cypher query examples, edge types, how to use search_graph.\"\n"
     "---\n"
     "\n"
     "# Codebase Memory — Knowledge Graph Tools\n"
@@ -1462,7 +1366,7 @@ static const char skill_content[] =
     "\n"
     "## Edge Types\n"
     "CALLS, HTTP_CALLS, ASYNC_CALLS, DATA_FLOWS, IMPORTS, DEFINES, DEFINES_METHOD,\n"
-    "HANDLES, IMPLEMENTS, OVERRIDE, USAGE, CONFIGURES, FILE_CHANGES_WITH,\n"
+    "HANDLES, IMPLEMENTS, OVERRIDE, USAGE, CALL_REFERENCE, CONFIGURES, FILE_CHANGES_WITH,\n"
     "SIMILAR_TO, SEMANTICALLY_RELATED, CONTAINS_FILE, CONTAINS_FOLDER,\n"
     "CONTAINS_PACKAGE\n"
     "\n"
@@ -1762,42 +1666,402 @@ static size_t cbm_json_mcp_ownership_fields(cbm_json_mcp_schema_t schema, const 
     return 3U;
 }
 
-static bool cbm_json_mcp_owned_command(const char *command, const char *expected_binary) {
+/* The running executable is trustworthy identity evidence: install/update can
+ * replace an exact-shape entry that still names the binary which initiated the
+ * coordinated activation. It is scoped to that synchronous refresh and never
+ * populated from config content. */
+static CBM_TLS const char *g_previous_managed_mcp_command = NULL;
+
+/* Path-shape-insensitive equality for OUR OWN binary path (#1582): clients
+ * and installers spell the same Windows file with different separators (the
+ * entry stores `C:\...\cbm.exe`, the installer compares `C:/.../cbm.exe`),
+ * and Windows filesystems are case-insensitive. Separators always compare
+ * equal; case only folds on Windows. POSIX byte-exactness otherwise holds. */
+static bool cbm_json_mcp_paths_equal(const char *a, const char *b) {
+    while (*a && *b) {
+        char ca = *a;
+        char cb = *b;
+        if (ca == '\\') {
+            ca = '/';
+        }
+        if (cb == '\\') {
+            cb = '/';
+        }
+#ifdef _WIN32
+        ca = (char)tolower((unsigned char)ca);
+        cb = (char)tolower((unsigned char)cb);
+#endif
+        if (ca != cb) {
+            return false;
+        }
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
+
+static bool cbm_json_mcp_owned_command(const char *command, const char *expected_binary,
+                                       const char *previous_managed_binary) {
     if (!command || command[0] == '\0') {
         return false;
     }
-    if (expected_binary && expected_binary[0] && strcmp(command, expected_binary) == 0) {
+    if (expected_binary && expected_binary[0] &&
+        cbm_json_mcp_paths_equal(command, expected_binary)) {
+        return true;
+    }
+    if (previous_managed_binary && previous_managed_binary[0] &&
+        cbm_json_mcp_paths_equal(command, previous_managed_binary)) {
         return true;
     }
     if (strcmp(command, "codebase-memory-mcp") == 0 ||
         strcmp(command, "codebase-memory-mcp.exe") == 0) {
         return true;
     }
-    /* No basename matching: /opt/custom/codebase-memory-mcp is foreign, not ours.
-     * The update path sets g_mcp_upsert_force to overwrite stale paths. */
+    /* No basename matching: /opt/custom/codebase-memory-mcp is foreign, not ours. */
     return false;
 }
+
+/* Ownership state beyond the config_json_like enum: the entry has exactly
+ * OUR schema shape under OUR reserved name, but its command is a concrete
+ * absolute Windows path that the local fixed-drive walk conclusively reports
+ * missing. Upsert repairs it; remove leaves it alone like any other non-owned
+ * entry. POSIX never probes config-supplied paths: only the running executable
+ * identity above can authorize a moved-install refresh. */
+enum {
+    CBM_JSON_MCP_OWNERSHIP_STALE = 100,
+    /* Repairable like STALE, but the entry carries client-added keys: only a
+     * FIELD-level repair may touch it — full replacement would drop them. */
+    CBM_JSON_MCP_OWNERSHIP_EXTRAS_STALE = 101,
+};
+
+#ifdef _WIN32
+typedef enum {
+    CBM_JSON_MCP_COMMAND_UNKNOWN = 0,
+    CBM_JSON_MCP_COMMAND_PRESENT,
+    CBM_JSON_MCP_COMMAND_MISSING,
+} cbm_json_mcp_command_availability_t;
+#endif
+
+#if defined(_WIN32) || defined(CBM_CLI_ENABLE_TEST_API)
+static bool cbm_json_mcp_command_path_probe_safe_for_platform(const char *command, bool windows) {
+    if (!command || !command[0]) {
+        return false;
+    }
+    if (windows) {
+        size_t length = strlen(command);
+        /* Never probe UNC or Win32 device namespaces from config content.
+         * GetFileAttributesW on those paths can perform outbound SMB
+         * authentication or block on an attacker-controlled endpoint. */
+        return length >= 3U && isalpha((unsigned char)command[0]) && command[1] == ':' &&
+               (command[2] == '/' || command[2] == '\\');
+    }
+    /* A slash-absolute POSIX path can cross autofs, NFS, FUSE, or a symlink
+     * before stat returns. Config bytes therefore never authorize a POSIX
+     * filesystem probe. */
+    return false;
+}
+#endif
+
+#ifdef _WIN32
+static bool cbm_json_mcp_command_path_probe_safe(const char *command) {
+    return cbm_json_mcp_command_path_probe_safe_for_platform(command, true);
+}
+#endif
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+static CBM_TLS int *g_mcp_command_path_probe_counter = NULL;
+
+bool cbm_mcp_command_path_probe_safe_for_testing(const char *command, bool windows) {
+    return cbm_json_mcp_command_path_probe_safe_for_platform(command, windows);
+}
+
+void cbm_set_mcp_command_path_probe_counter_for_testing(int *counter) {
+    g_mcp_command_path_probe_counter = counter;
+}
+#endif
+
+#ifdef _WIN32
+static bool cbm_json_mcp_windows_path_character_forbidden(wchar_t character) {
+    return character < L' ' || character == L':' || character == L'*' || character == L'?' ||
+           character == L'"' || character == L'<' || character == L'>' || character == L'|';
+}
+
+static bool cbm_json_mcp_windows_path_syntax_valid(const wchar_t *path) {
+    size_t length = path ? wcslen(path) : 0U;
+    bool ascii_drive = length >= 1U && ((path[0] >= L'A' && path[0] <= L'Z') ||
+                                        (path[0] >= L'a' && path[0] <= L'z'));
+    if (length < 3U || !ascii_drive || path[1] != L':' || path[2] != L'\\') {
+        return false;
+    }
+    size_t component_start = 3U;
+    for (size_t index = component_start; index <= length; index++) {
+        if (index < length && path[index] != L'\\') {
+            if (cbm_json_mcp_windows_path_character_forbidden(path[index])) {
+                return false;
+            }
+            continue;
+        }
+        if (index == component_start) {
+            return length == 3U && index == length;
+        }
+        size_t component_length = index - component_start;
+        const wchar_t *component = path + component_start;
+        if ((component_length == 1U && component[0] == L'.') ||
+            (component_length == 2U && component[0] == L'.' && component[1] == L'.') ||
+            component[component_length - 1U] == L'.' || component[component_length - 1U] == L' ') {
+            return false;
+        }
+        component_start = index + 1U;
+    }
+    return true;
+}
+
+static wchar_t *cbm_json_mcp_windows_path_from_utf8(const char *path) {
+    int needed = path ? MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0) : 0;
+    if (needed <= 0 || needed > MAX_PATH) {
+        return NULL;
+    }
+    wchar_t *wide = malloc((size_t)needed * sizeof(*wide));
+    if (!wide || MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wide, needed) <= 0) {
+        free(wide);
+        return NULL;
+    }
+    for (int index = 0; index < needed - 1; index++) {
+        if (wide[index] == L'/') {
+            wide[index] = L'\\';
+        }
+    }
+    if (!cbm_json_mcp_windows_path_syntax_valid(wide)) {
+        free(wide);
+        return NULL;
+    }
+    return wide;
+}
+
+static bool cbm_json_mcp_windows_handle_is_local(HANDLE handle, wchar_t expected_drive,
+                                                 BY_HANDLE_FILE_INFORMATION *information_out) {
+    BY_HANDLE_FILE_INFORMATION information;
+    if (handle == INVALID_HANDLE_VALUE || GetFileType(handle) != FILE_TYPE_DISK ||
+        !GetFileInformationByHandle(handle, &information) ||
+        (information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        return false;
+    }
+    DWORD capacity =
+        GetFinalPathNameByHandleW(handle, NULL, 0, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (capacity < 8U || capacity > 32768U) {
+        return false;
+    }
+    wchar_t *resolved = malloc((size_t)capacity * sizeof(*resolved));
+    if (!resolved) {
+        return false;
+    }
+    DWORD length = GetFinalPathNameByHandleW(handle, resolved, capacity,
+                                             FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    wchar_t actual_drive = length >= 7U ? resolved[4] : L'\0';
+    if (actual_drive >= L'a' && actual_drive <= L'z') {
+        actual_drive -= L'a' - L'A';
+    }
+    if (expected_drive >= L'a' && expected_drive <= L'z') {
+        expected_drive -= L'a' - L'A';
+    }
+    bool valid = length >= 7U && length < capacity && resolved[0] == L'\\' &&
+                 resolved[1] == L'\\' && resolved[2] == L'?' && resolved[3] == L'\\' &&
+                 resolved[5] == L':' && resolved[6] == L'\\' && actual_drive == expected_drive;
+    free(resolved);
+    if (valid && information_out) {
+        *information_out = information;
+    }
+    return valid;
+}
+
+static cbm_json_mcp_command_availability_t cbm_json_mcp_probe_windows_command_path(
+    const char *path) {
+    wchar_t *wide = cbm_json_mcp_windows_path_from_utf8(path);
+    if (!wide) {
+        return CBM_JSON_MCP_COMMAND_UNKNOWN;
+    }
+    wchar_t volume_root[4] = {wide[0], L':', L'\\', L'\0'};
+    UINT drive_type = GetDriveTypeW(volume_root);
+    if (drive_type != DRIVE_FIXED && drive_type != DRIVE_RAMDISK) {
+        free(wide);
+        return CBM_JSON_MCP_COMMAND_UNKNOWN;
+    }
+
+    size_t length = wcslen(wide);
+    if (length == 3U) {
+        free(wide);
+        return CBM_JSON_MCP_COMMAND_PRESENT;
+    }
+    wchar_t *partial = malloc((length + 1U) * sizeof(*partial));
+    HANDLE *component_handles = calloc(length + 1U, sizeof(*component_handles));
+    if (!partial || !component_handles) {
+        free(component_handles);
+        free(partial);
+        free(wide);
+        return CBM_JSON_MCP_COMMAND_UNKNOWN;
+    }
+    memcpy(partial, wide, (length + 1U) * sizeof(*partial));
+    cbm_json_mcp_command_availability_t availability = CBM_JSON_MCP_COMMAND_UNKNOWN;
+    size_t component_handle_count = 0U;
+
+    /* Retain every validated ancestor without write/delete sharing until the
+     * classification is complete. Otherwise a same-account concurrent writer
+     * could replace a checked directory with a junction before the next
+     * absolute-path open, causing that open to follow an SMB target. */
+    HANDLE root_handle =
+        CreateFileW(volume_root, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    BY_HANDLE_FILE_INFORMATION root_information;
+    if (!cbm_json_mcp_windows_handle_is_local(root_handle, wide[0], &root_information) ||
+        (root_information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+        if (root_handle != INVALID_HANDLE_VALUE) {
+            (void)CloseHandle(root_handle);
+        }
+        free(component_handles);
+        free(partial);
+        free(wide);
+        return CBM_JSON_MCP_COMMAND_UNKNOWN;
+    }
+    component_handles[component_handle_count++] = root_handle;
+
+    for (size_t index = 3U; index <= length; index++) {
+        if (index < length && partial[index] != L'\\') {
+            continue;
+        }
+        bool final_component = index == length;
+        wchar_t saved = partial[index];
+        partial[index] = L'\0';
+        HANDLE component =
+            CreateFileW(partial, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+        DWORD error = component == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+        BY_HANDLE_FILE_INFORMATION information;
+        bool local = cbm_json_mcp_windows_handle_is_local(component, wide[0], &information);
+        if (local) {
+            component_handles[component_handle_count++] = component;
+        } else if (component != INVALID_HANDLE_VALUE) {
+            (void)CloseHandle(component);
+        }
+        partial[index] = saved;
+
+        if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) {
+            availability = CBM_JSON_MCP_COMMAND_MISSING;
+            break;
+        }
+        if (error != ERROR_SUCCESS || !local ||
+            (!final_component && (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)) {
+            availability = CBM_JSON_MCP_COMMAND_UNKNOWN;
+            break;
+        }
+        if (final_component) {
+            availability = CBM_JSON_MCP_COMMAND_PRESENT;
+            break;
+        }
+    }
+    for (size_t handle_index = 0U; handle_index < component_handle_count; handle_index++) {
+        (void)CloseHandle(component_handles[handle_index]);
+    }
+    free(component_handles);
+    free(partial);
+    free(wide);
+    return availability;
+}
+#endif
+
+#ifdef _WIN32
+static cbm_json_mcp_command_availability_t cbm_json_mcp_probe_command_path(const char *path) {
+#ifdef CBM_CLI_ENABLE_TEST_API
+    if (g_mcp_command_path_probe_counter) {
+        (*g_mcp_command_path_probe_counter)++;
+    }
+#endif
+    return cbm_json_mcp_probe_windows_command_path(path);
+}
+
+/* Repair only a concrete fixed-drive path with a conclusive local "not found"
+ * result. Bare/relative/templated commands and filesystem errors remain
+ * fail-closed. POSIX never enters this classifier. */
+static cbm_json_mcp_command_availability_t cbm_json_mcp_command_availability(const char *command) {
+    if (!cbm_json_mcp_command_path_probe_safe(command) || strchr(command, '$') ||
+        strchr(command, '%')) {
+        return CBM_JSON_MCP_COMMAND_UNKNOWN;
+    }
+    cbm_json_mcp_command_availability_t availability = cbm_json_mcp_probe_command_path(command);
+    if (availability != CBM_JSON_MCP_COMMAND_MISSING) {
+        return availability;
+    }
+    const char *slash = strrchr(command, '/');
+    const char *backslash = strrchr(command, '\\');
+    const char *basename = slash && backslash
+                               ? (slash > backslash ? slash + 1 : backslash + 1)
+                               : (slash ? slash + 1 : (backslash ? backslash + 1 : command));
+    if (!basename[0] || strchr(basename, '.')) {
+        return CBM_JSON_MCP_COMMAND_MISSING;
+    }
+    /* An extensionless command can resolve through a client-specific or
+     * custom PATHEXT suffix that is not present in the installer's process.
+     * Absence of the literal file therefore never proves absence of the
+     * command. Preserve it unless positive prior-image identity matched. */
+    availability = CBM_JSON_MCP_COMMAND_UNKNOWN;
+    return availability;
+}
+#endif
 
 static int cbm_json_mcp_snapshot_ownership(const char *document, size_t document_length,
                                            const char *const *object_path, size_t path_len,
                                            cbm_json_mcp_schema_t schema, const char *entry_name,
-                                           const char *argument, const char *expected_binary) {
+                                           const char *argument, const char *expected_binary,
+                                           const char *previous_managed_binary,
+                                           char **command_out) {
     cbm_json_like_object_field_t fields[3];
     size_t field_count = cbm_json_mcp_ownership_fields(schema, argument, fields);
     char *command = NULL;
     int result = cbm_json_like_match_object_entry(document, document_length, object_path, path_len,
                                                   entry_name, fields, field_count, &command);
-    if (result == CBM_JSON_LIKE_OBJECT_MATCH &&
-        !cbm_json_mcp_owned_command(command, expected_binary)) {
+    if ((result == CBM_JSON_LIKE_OBJECT_MATCH ||
+         result == CBM_JSON_LIKE_OBJECT_MATCH_WITH_EXTRAS) &&
+        !cbm_json_mcp_owned_command(command, expected_binary, previous_managed_binary)) {
+#ifdef _WIN32
+        bool had_extras = result == CBM_JSON_LIKE_OBJECT_MATCH_WITH_EXTRAS;
+        result =
+            cbm_json_mcp_command_availability(command) == CBM_JSON_MCP_COMMAND_MISSING
+                ? (had_extras ? CBM_JSON_MCP_OWNERSHIP_EXTRAS_STALE : CBM_JSON_MCP_OWNERSHIP_STALE)
+                : CBM_JSON_LIKE_OBJECT_MISMATCH;
+#else
         result = CBM_JSON_LIKE_OBJECT_MISMATCH;
+#endif
     }
-    free(command);
+    if (command_out) {
+        *command_out = command;
+    } else {
+        free(command);
+    }
     return result;
 }
 
-/* When true, cbm_upsert_json_named_mcp allows overwriting MISMATCH entries (stale paths).
- * Set by cbm_install_agent_configs during update; install leaves it false. */
-static bool g_mcp_upsert_force = false;
+/* Render just the `command` member's VALUE for a schema — the raw JSON the
+ * field-level repair splices in place of a moved install's stale path. */
+static char *cbm_json_mcp_render_command_value(const char *binary_path,
+                                               cbm_json_mcp_schema_t schema) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return NULL;
+    }
+    yyjson_mut_val *command = cbm_json_mcp_command_is_array(schema)
+                                  ? yyjson_mut_arr(doc)
+                                  : yyjson_mut_strcpy(doc, binary_path);
+    bool ok = command != NULL;
+    if (ok && cbm_json_mcp_command_is_array(schema)) {
+        ok = yyjson_mut_arr_add_strcpy(doc, command, binary_path);
+    }
+    char *json = NULL;
+    if (ok) {
+        yyjson_mut_doc_set_root(doc, command);
+        json = yyjson_mut_write(doc, YYJSON_WRITE_NOFLAG, NULL);
+    }
+    yyjson_mut_doc_free(doc);
+    return json;
+}
 
 static int cbm_upsert_json_named_mcp(const char *binary_path, const char *config_path,
                                      const char *const *object_path, size_t path_len,
@@ -1813,20 +2077,78 @@ static int cbm_upsert_json_named_mcp(const char *binary_path, const char *config
         return CLI_ERR;
     }
     if (read_result == 0) {
-        int ownership =
-            cbm_json_mcp_snapshot_ownership(document, document_length, object_path, path_len,
-                                            schema, entry_name, argument, binary_path);
-        switch (ownership) {
-        case CBM_JSON_LIKE_OBJECT_MATCH:
-        case CBM_JSON_LIKE_OBJECT_MISSING:
-            break;
-        case CBM_JSON_LIKE_OBJECT_MISMATCH:
-            if (g_mcp_upsert_force) {
-                break; /* update: overwrite stale paths */
+        char *command = NULL;
+        int ownership = cbm_json_mcp_snapshot_ownership(
+            document, document_length, object_path, path_len, schema, entry_name, argument,
+            binary_path, g_previous_managed_mcp_command, &command);
+        /* An entry that already says what we would say, but carries extra keys
+         * the client added, is ALREADY SATISFIED. Return success without
+         * touching the file.
+         *
+         * We must not rewrite it: the editor replaces an entry wholesale, so
+         * writing our canonical shape over it would delete those keys. Doing
+         * nothing is both correct and lossless — the entry already points at
+         * this binary with the right type, which is the whole content of the
+         * install.
+         *
+         * This is #1630: OpenCode writes `"enabled": true` next to our
+         * `command` and `type`, so every user who had toggled a server in the
+         * UI hit `op=mcp_install` failure. Confirmed on Linux and Windows with
+         * two independent configs. Merging our fields into an annotated entry
+         * while preserving the rest is the fuller fix and is tracked there;
+         * this makes the common case work without risking anyone's config. */
+        if (ownership == CBM_JSON_LIKE_OBJECT_MATCH_WITH_EXTRAS) {
+            /* Owned via the PREVIOUS managed binary during a relocating
+             * update: the annotated entry still names the old location, and a
+             * wholesale rewrite would drop the client's keys — repair only the
+             * command member (#1630's deferred field-merge). An entry already
+             * naming the current binary needs nothing. */
+            bool via_previous = command && g_previous_managed_mcp_command &&
+                                strcmp(command, g_previous_managed_mcp_command) == 0 &&
+                                strcmp(command, binary_path) != 0;
+            if (!via_previous) {
+                free(command);
+                free(document);
+                return CLI_OK;
             }
+            char *value = cbm_json_mcp_render_command_value(binary_path, schema);
+            if (!value) {
+                free(command);
+                free(document);
+                return CLI_ERR;
+            }
+            int repair = cbm_json_like_replace_field_raw_if_unchanged(
+                config_path, object_path, path_len, entry_name, "command", value, document,
+                document_length);
+            free(value);
+            free(command);
             free(document);
-            return CLI_ERR;
-        default:
+            return repair == 0 ? CLI_OK : CLI_ERR;
+        }
+        /* Windows only: our shape, annotated, and the named binary
+         * conclusively missing from the local fixed drives — repair ONLY the
+         * command member so the client's keys survive (#1630 field-merge). */
+        if (ownership == CBM_JSON_MCP_OWNERSHIP_EXTRAS_STALE) {
+            char *value = cbm_json_mcp_render_command_value(binary_path, schema);
+            if (!value) {
+                free(command);
+                free(document);
+                return CLI_ERR;
+            }
+            int repair = cbm_json_like_replace_field_raw_if_unchanged(
+                config_path, object_path, path_len, entry_name, "command", value, document,
+                document_length);
+            free(value);
+            free(command);
+            free(document);
+            return repair == 0 ? CLI_OK : CLI_ERR;
+        }
+        /* STALE (our exact shape, dead binary path on Windows) is repairable
+         * — that is the update contract. Only a genuinely foreign shape
+         * refuses. */
+        free(command);
+        if (ownership != CBM_JSON_LIKE_OBJECT_MATCH && ownership != CBM_JSON_LIKE_OBJECT_MISSING &&
+            ownership != CBM_JSON_MCP_OWNERSHIP_STALE) {
             free(document);
             return CLI_ERR;
         }
@@ -1871,8 +2193,9 @@ static int cbm_remove_json_named_mcp(const char *config_path, const char *const 
     }
     int ownership =
         cbm_json_mcp_snapshot_ownership(document, document_length, object_path, path_len, schema,
-                                        entry_name, argument, expected_binary);
-    if (ownership == CBM_JSON_LIKE_OBJECT_MISSING || ownership == CBM_JSON_LIKE_OBJECT_MISMATCH) {
+                                        entry_name, argument, expected_binary, NULL, NULL);
+    if (ownership == CBM_JSON_LIKE_OBJECT_MISSING || ownership == CBM_JSON_LIKE_OBJECT_MISMATCH ||
+        ownership == CBM_JSON_MCP_OWNERSHIP_STALE) {
         free(document);
         return CLI_OK;
     }
@@ -1899,6 +2222,18 @@ int cbm_install_editor_mcp(const char *binary_path, const char *config_path) {
     static const char *const path[] = {"mcpServers"};
     return cbm_upsert_json_mcp(binary_path, config_path, path, 1U, CBM_JSON_MCP_STANDARD);
 }
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+int cbm_install_editor_mcp_with_previous_for_testing(const char *binary_path,
+                                                     const char *previous_binary_path,
+                                                     const char *config_path) {
+    const char *saved = g_previous_managed_mcp_command;
+    g_previous_managed_mcp_command = previous_binary_path;
+    int result = cbm_install_editor_mcp(binary_path, config_path);
+    g_previous_managed_mcp_command = saved;
+    return result;
+}
+#endif
 
 int cbm_remove_editor_mcp(const char *config_path) {
     static const char *const path[] = {"mcpServers"};
@@ -2251,6 +2586,20 @@ static void cbm_opencode_config_path(const char *home_dir, char *out, size_t out
     const char *custom = cbm_safe_getenv("OPENCODE_CONFIG", env_buf, sizeof(env_buf), NULL);
     if (custom && custom[0]) {
         snprintf(out, out_sz, "%s", custom);
+        return;
+    }
+    /* OpenCode reads either opencode.json or opencode.jsonc. We always wrote
+     * the .json name, so a user whose real config is .jsonc got a SECOND file
+     * that OpenCode ignores — their MCP server silently never appeared, and the
+     * install looked like it had succeeded (discussion #1560). Prefer whichever
+     * file already exists, .jsonc first since it is the one we used to miss;
+     * with neither present, create .json as before. Other clients in this file
+     * (pochi, kilo) already carry .jsonc paths — OpenCode was the gap. */
+    char candidate[CLI_BUF_1K];
+    int written = snprintf(candidate, sizeof(candidate), "%s/.config/opencode/opencode.jsonc",
+                           home_dir ? home_dir : "");
+    if (written > 0 && (size_t)written < sizeof(candidate) && cbm_file_exists(candidate)) {
+        snprintf(out, out_sz, "%s", candidate);
         return;
     }
     snprintf(out, out_sz, "%s/.config/opencode/opencode.json", home_dir);
@@ -3099,8 +3448,29 @@ int cbm_upsert_codex_mcp(const char *binary_path, const char *config_path) {
         return CLI_ERR;
     }
     char block[CLI_BUF_8K];
+    /* #1562: Codex sanitizes the environment of stdio MCP subprocesses, passing
+     * through only the names listed in env_vars. Without CBM_CACHE_DIR the
+     * Codex-spawned server silently falls back to the DEFAULT cache while the
+     * account daemon uses the configured one; the two disagree and the
+     * handshake closes during initialization, so Codex exposes no cbm tools at
+     * all.
+     *
+     * The names are listed unconditionally rather than only when a variable is
+     * set at install time: env_vars names variables to FORWARD IF PRESENT, so
+     * listing them costs nothing when unset and keeps working for someone who
+     * sets one after installing — which install-time detection would silently
+     * fail to cover.
+     *
+     * CBM_RUNTIME_DIR joined the list with #1664: since #1645 it relocates
+     * the daemon rendezvous, so a Codex subprocess that does not receive it
+     * looks for the daemon in the DEFAULT location and never finds it — the
+     * same silent client/daemon split CBM_CACHE_DIR caused. Both names decide
+     * WHICH daemon a process talks to; behavioural knobs stay unforwarded. */
     int written = snprintf(block, sizeof(block),
-                           CODEX_CMM_SECTION "\ncommand = \"%s\"\nargs = []\n", escaped);
+                           CODEX_CMM_SECTION "\ncommand = \"%s\"\nargs = []\n"
+                                             "env_vars = [\"CBM_CACHE_DIR\", "
+                                             "\"CBM_RUNTIME_DIR\"]\n",
+                           escaped);
     if (written < 0 || (size_t)written >= sizeof(block) ||
         cbm_remove_codex_legacy_mcp(config_path) != 0) {
         return CLI_ERR;
@@ -3237,43 +3607,31 @@ bool cbm_optional_hook_supported_for_testing(const char *agent_name, bool window
 }
 #endif
 
-static int cbm_upsert_codex_hooks_command(const char *config_path, const char *command,
-                                          const char *command_windows) {
+static int cbm_reconcile_codex_hooks_command_detailed(const char *config_path, const char *command,
+                                                      const char *command_windows,
+                                                      cbm_toml_codex_hook_action_t action,
+                                                      bool check_only,
+                                                      cbm_toml_codex_hook_failure_t *failure) {
     if (!config_path || !command || !command_windows) {
         return CLI_ERR;
     }
-    char escaped[CLI_BUF_8K];
-    char escaped_windows[CLI_BUF_8K];
-    if (cbm_toml_escape_basic_string(command, escaped, sizeof(escaped)) != CLI_OK ||
-        cbm_toml_escape_basic_string(command_windows, escaped_windows, sizeof(escaped_windows)) !=
-            CLI_OK) {
-        return CLI_ERR;
-    }
-    char block[CLI_BUF_8K];
-    int written = snprintf(block, sizeof(block),
-                           "[[hooks.SessionStart]]\n"
-                           "matcher = \"startup|resume|clear|compact\"\n\n"
-                           "[[hooks.SessionStart.hooks]]\n"
-                           "type = \"command\"\n"
-                           "command = \"%s\"\n"
-                           "command_windows = \"%s\"\n"
-                           "timeout = 5\n\n"
-                           "[[hooks.SubagentStart]]\n"
-                           "matcher = \"*\"\n\n"
-                           "[[hooks.SubagentStart.hooks]]\n"
-                           "type = \"command\"\n"
-                           "command = \"%s\"\n"
-                           "command_windows = \"%s\"\n"
-                           "timeout = 5\n",
-                           escaped, escaped_windows, escaped, escaped_windows);
-    if (written < 0 || (size_t)written >= sizeof(block)) {
-        return CLI_ERR;
-    }
-    return cbm_toml_upsert_managed_block(config_path, CODEX_HOOK_BEGIN, CODEX_HOOK_END, block) == 0
+    return cbm_toml_reconcile_codex_hooks_detailed(config_path, CODEX_HOOK_BEGIN, CODEX_HOOK_END,
+                                                   command, command_windows, action,
+                                                   check_only ? 1 : 0, failure) == 0
                ? CLI_OK
                : CLI_ERR;
 }
-
+static int cbm_reconcile_codex_hooks_command(const char *config_path, const char *command,
+                                             const char *command_windows,
+                                             cbm_toml_codex_hook_action_t action, bool check_only) {
+    return cbm_reconcile_codex_hooks_command_detailed(config_path, command, command_windows, action,
+                                                      check_only, NULL);
+}
+static int cbm_upsert_codex_hooks_command(const char *config_path, const char *command,
+                                          const char *command_windows) {
+    return cbm_reconcile_codex_hooks_command(config_path, command, command_windows,
+                                             CBM_TOML_CODEX_HOOK_UPSERT, false);
+}
 /* Public path used by config-level regression tests and manual callers. */
 int cbm_upsert_codex_hooks(const char *config_path) {
     return cbm_upsert_codex_hooks_command(config_path, "codebase-memory-mcp hook-augment",
@@ -3281,10 +3639,9 @@ int cbm_upsert_codex_hooks(const char *config_path) {
 }
 
 int cbm_remove_codex_hooks(const char *config_path) {
-    return config_path &&
-                   cbm_toml_remove_managed_block(config_path, CODEX_HOOK_BEGIN, CODEX_HOOK_END) == 0
-               ? CLI_OK
-               : CLI_ERR;
+    return cbm_reconcile_codex_hooks_command(config_path, "codebase-memory-mcp hook-augment",
+                                             "codebase-memory-mcp hook-augment",
+                                             CBM_TOML_CODEX_HOOK_REMOVE, false);
 }
 
 /* ── OpenCode MCP config (JSON with "mcp" key) ───────────────── */
@@ -3479,7 +3836,11 @@ static int cbm_build_yaml_stdio_mcp_block(const char *binary_path, bool goose_sc
         free(encoded);
         return CLI_ERR;
     }
+    /* goose's ExtensionConfig::Stdio requires `name` (serde, no default) and
+     * its loader silently drops entries that fail to deserialize (#1675) — an
+     * entry without it installs cleanly and is then invisible in goose. */
     int written = goose_schema ? snprintf(block, block_size,
+                                          "    name: codebase-memory-mcp\n"
                                           "    type: stdio\n"
                                           "    cmd: %s\n"
                                           "    args: []\n"
@@ -3489,6 +3850,19 @@ static int cbm_build_yaml_stdio_mcp_block(const char *binary_path, bool goose_sc
     free(encoded);
     return written > 0 && (size_t)written < block_size ? CLI_OK : CLI_ERR;
 }
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+/* Test seam for the agent-config block writers: the exact bytes written into a
+ * coding agent's config file are a compatibility contract with THAT agent's
+ * parser (goose deserializes with serde and silently drops entries that fail —
+ * #1675), so tests must be able to assert the block verbatim. */
+int cbm_cli_build_yaml_stdio_mcp_block_for_test(const char *binary_path, bool goose_schema,
+                                                char *block, size_t block_size) {
+    return cbm_build_yaml_stdio_mcp_block(binary_path, goose_schema, block, block_size) == CLI_OK
+               ? 0
+               : -1;
+}
+#endif
 
 static int cbm_upsert_yaml_stdio_mcp(const char *binary_path, const char *config_path,
                                      const char *section_key, bool goose_schema) {
@@ -3570,10 +3944,11 @@ static int cbm_junie_mcp_preflight(const char *binary_path, const char *config_p
     }
     int result = CLI_OK;
     for (size_t i = 0U; i < sizeof(entries) / sizeof(entries[0]); i++) {
-        int ownership = cbm_json_mcp_snapshot_ownership(document, document_length, path, 1U,
-                                                        CBM_JSON_MCP_STANDARD, entries[i].name,
-                                                        entries[i].argument, binary_path);
-        if (ownership != CBM_JSON_LIKE_OBJECT_MATCH && ownership != CBM_JSON_LIKE_OBJECT_MISSING) {
+        int ownership = cbm_json_mcp_snapshot_ownership(
+            document, document_length, path, 1U, CBM_JSON_MCP_STANDARD, entries[i].name,
+            entries[i].argument, binary_path, g_previous_managed_mcp_command, NULL);
+        if (ownership != CBM_JSON_LIKE_OBJECT_MATCH && ownership != CBM_JSON_LIKE_OBJECT_MISSING &&
+            ownership != CBM_JSON_MCP_OWNERSHIP_STALE) {
             result = CLI_ERR;
             break;
         }
@@ -3597,6 +3972,18 @@ int cbm_upsert_junie_mcp(const char *binary_path, const char *config_path) {
     }
     return CLI_OK;
 }
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+int cbm_upsert_junie_mcp_with_previous_for_testing(const char *binary_path,
+                                                   const char *previous_binary_path,
+                                                   const char *config_path) {
+    const char *saved = g_previous_managed_mcp_command;
+    g_previous_managed_mcp_command = previous_binary_path;
+    int result = cbm_upsert_junie_mcp(binary_path, config_path);
+    g_previous_managed_mcp_command = saved;
+    return result;
+}
+#endif
 
 int cbm_remove_junie_mcp(const char *config_path) {
     static const char *const path[] = {"mcpServers"};
@@ -5136,6 +5523,53 @@ static bool cbm_install_subagent_reminder_script(const char *home, const char *b
     return cbm_write_owned_hook_script_with_legacy(script_path, script, legacy, 1U);
 }
 
+/* #1387 dry-run predicate: would writing this hook script succeed, or would
+ * the owned-document migration refuse it because the file on disk is not ours?
+ * Read-only — it must never touch the filesystem, since a dry run promises
+ * exactly that. An unreadable/unsafe state counts as "would not succeed": the
+ * preview should warn rather than promise. */
+static bool cbm_hook_script_write_would_succeed(const char *home, const char *binary_path,
+                                                const char *script_name) {
+    if (!home || !binary_path || !script_name) {
+        return false;
+    }
+    char config_dir[CLI_BUF_1K];
+    cbm_claude_config_dir(home, config_dir, sizeof(config_dir));
+    if (!config_dir[0]) {
+        return false;
+    }
+    char script_path[CLI_BUF_1K];
+    int written =
+        snprintf(script_path, sizeof(script_path), "%s/hooks/%s", config_dir, script_name);
+    if (written <= 0 || (size_t)written >= sizeof(script_path)) {
+        return false;
+    }
+    const char *prefix = cmm_gate_script_prefix;
+    if (strcmp(script_name, CMM_SESSION_REMINDER_SCRIPT) == 0) {
+        prefix = cmm_session_script_prefix;
+    } else if (strcmp(script_name, CMM_SUBAGENT_REMINDER_SCRIPT) == 0) {
+        prefix = cmm_subagent_script_prefix;
+    }
+    char script[CLI_BUF_8K];
+    if (cbm_build_current_hook_script(prefix, binary_path, script, sizeof(script)) != CLI_OK) {
+        return false;
+    }
+    /* Released shapes are accepted by the real write, so they must be accepted
+     * here too or the preview would warn about a script that upgrades fine. */
+    char released[CLI_BUF_8K];
+    const char *candidates[2];
+    size_t candidate_count = 0U;
+    if (strcmp(script_name, CMM_HOOK_GATE_SCRIPT) == 0 &&
+        cbm_build_released_gate_script(binary_path, released, sizeof(released)) == CLI_OK) {
+        candidates[candidate_count++] = released;
+    } else if (strcmp(script_name, CMM_SESSION_REMINDER_SCRIPT) == 0) {
+        candidates[candidate_count++] = cmm_released_session_script;
+    } else if (strcmp(script_name, CMM_SUBAGENT_REMINDER_SCRIPT) == 0) {
+        candidates[candidate_count++] = cmm_released_subagent_script;
+    }
+    return cbm_text_owned_document_status(script_path, script, candidates, candidate_count) == 0;
+}
+
 int cbm_upsert_claude_subagent_hooks(const char *settings_path) {
     char command[CLI_BUF_8K];
     char previous_command[CLI_BUF_8K];
@@ -5618,15 +6052,104 @@ static bool cli_windows_path_segment_equal(const wchar_t *segment, size_t segmen
     return segment_length == directory_length && _wcsnicmp(segment, directory, segment_length) == 0;
 }
 
+static bool cli_windows_smoke_download_url_valid(void) {
+    wchar_t url[CLI_BUF_128];
+    DWORD length =
+        GetEnvironmentVariableW(L"SMOKE_DOWNLOAD_URL", url, (DWORD)(sizeof(url) / sizeof(url[0])));
+    if (length == 0U || length >= (DWORD)(sizeof(url) / sizeof(url[0]))) {
+        return false;
+    }
+    static const wchar_t prefix[] = L"http://127.0.0.1:";
+    if (wcsncmp(url, prefix, (sizeof(prefix) / sizeof(prefix[0])) - 1U) != 0) {
+        return false;
+    }
+    const wchar_t *cursor = url + (sizeof(prefix) / sizeof(prefix[0])) - 1U;
+    unsigned long port = 0UL;
+    if (*cursor < L'0' || *cursor > L'9') {
+        return false;
+    }
+    while (*cursor >= L'0' && *cursor <= L'9') {
+        unsigned long digit = (unsigned long)(*cursor - L'0');
+        if (port > (65535UL - digit) / 10UL) {
+            return false;
+        }
+        port = port * 10UL + digit;
+        cursor++;
+    }
+    return *cursor == L'\0' && port > 0UL;
+}
+
+/* The release smoke must exercise the production registry query/append/write
+ * path without ever mutating the developer's live HKCU\Environment\Path.
+ * A pre-created, GUID-named leaf is accepted only under the complete local
+ * loopback smoke contract. Presence with any invalid gate fails closed. */
+static int cli_windows_open_user_path_key(HKEY *environment) {
+    if (!environment) {
+        return CLI_ERR;
+    }
+    *environment = NULL;
+
+    SetLastError(ERROR_SUCCESS);
+    DWORD needed = GetEnvironmentVariableW(L"CBM_TEST_WINDOWS_USER_PATH_RUN_ID", NULL, 0U);
+    DWORD run_id_error = GetLastError();
+    if (needed == 0U && run_id_error == ERROR_ENVVAR_NOT_FOUND) {
+        return RegOpenKeyExW(HKEY_CURRENT_USER, L"Environment", 0, KEY_QUERY_VALUE | KEY_SET_VALUE,
+                             environment) == ERROR_SUCCESS
+                   ? CLI_OK
+                   : CLI_ERR;
+    }
+
+    wchar_t run_id[CLI_BUF_32 + 1U];
+    if (needed != CLI_BUF_32 + 1U ||
+        GetEnvironmentVariableW(L"CBM_TEST_WINDOWS_USER_PATH_RUN_ID", run_id,
+                                (DWORD)(sizeof(run_id) / sizeof(run_id[0]))) != CLI_BUF_32) {
+        return CLI_ERR;
+    }
+    for (size_t index = 0; index < CLI_BUF_32; index++) {
+        wchar_t value = run_id[index];
+        if (!((value >= L'0' && value <= L'9') || (value >= L'a' && value <= L'f') ||
+              (value >= L'A' && value <= L'F'))) {
+            return CLI_ERR;
+        }
+    }
+
+    SetLastError(ERROR_SUCCESS);
+    DWORD smoke_root_needed = GetEnvironmentVariableW(L"SMOKE_TEMP_ROOT", NULL, 0U);
+    if (smoke_root_needed <= 1U || !cli_windows_smoke_download_url_valid()) {
+        return CLI_ERR;
+    }
+
+    wchar_t key_path[CLI_BUF_128];
+    int key_length = swprintf(key_path, sizeof(key_path) / sizeof(key_path[0]),
+                              L"Software\\CodebaseMemoryMCP\\Smoke\\%ls", run_id);
+    if (key_length <= 0 || (size_t)key_length >= sizeof(key_path) / sizeof(key_path[0]) ||
+        RegOpenKeyExW(HKEY_CURRENT_USER, key_path, 0,
+                      KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_WOW64_64KEY,
+                      environment) != ERROR_SUCCESS) {
+        return CLI_ERR;
+    }
+
+    wchar_t sentinel[CLI_BUF_32 + 1U] = {0};
+    DWORD sentinel_type = 0U;
+    DWORD sentinel_bytes = (DWORD)sizeof(sentinel);
+    LONG sentinel_status = RegQueryValueExW(*environment, L"CbmSmokeRunId", NULL, &sentinel_type,
+                                            (BYTE *)sentinel, &sentinel_bytes);
+    if (sentinel_status != ERROR_SUCCESS || sentinel_type != REG_SZ ||
+        sentinel_bytes != (CLI_BUF_32 + 1U) * sizeof(wchar_t) || wcscmp(sentinel, run_id) != 0) {
+        RegCloseKey(*environment);
+        *environment = NULL;
+        return CLI_ERR;
+    }
+    return CLI_OK;
+}
+
 /* Persist the current-user PATH while the activation lease is held. The
  * installer script may update only its process-local PATH after this returns;
  * it must not perform a second persistent mutation outside coordination. */
 static int cli_ensure_windows_user_path(const char *bin_dir, bool dry_run) {
     wchar_t *wide_dir = cli_windows_utf8_to_wide(bin_dir);
     HKEY environment = NULL;
-    if (!wide_dir ||
-        RegOpenKeyExW(HKEY_CURRENT_USER, L"Environment", 0, KEY_QUERY_VALUE | KEY_SET_VALUE,
-                      &environment) != ERROR_SUCCESS) {
+    if (!wide_dir || cli_windows_open_user_path_key(&environment) != CLI_OK) {
         free(wide_dir);
         return CLI_ERR;
     }
@@ -5717,488 +6240,23 @@ static int cli_ensure_windows_user_path(const char *bin_dir, bool dry_run) {
     return CLI_OK;
 }
 
-/* Canonical, file-API-safe wide form: full resolution plus the extended-length
- * prefix once the resolved path nears the legacy MAX_PATH limit (240, matching
- * the activation and foundation converters). Every derived install path
- * (generations, state, patterns) inherits the prefix from its root, which
- * keeps hardlink-identity and backing comparisons form-consistent. */
-static bool cli_windows_canonicalize_launcher_path(wchar_t path[CBM_WINDOWS_LAUNCHER_PATH_CAP]) {
-    if (!path || !path[0]) {
-        return false;
-    }
-    wchar_t resolved[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    DWORD length = GetFullPathNameW(path, CBM_WINDOWS_LAUNCHER_PATH_CAP, resolved, NULL);
-    if (length == 0 || length >= CBM_WINDOWS_LAUNCHER_PATH_CAP) {
-        return false;
-    }
-    bool already_prefixed = wcsncmp(resolved, L"\\\\?\\", 4) == 0;
-    bool drive_absolute = !already_prefixed &&
-                          ((resolved[0] >= L'A' && resolved[0] <= L'Z') ||
-                           (resolved[0] >= L'a' && resolved[0] <= L'z')) &&
-                          resolved[1] == L':' && resolved[2] == L'\\';
-    /* Always extended-length, not just past a threshold: derived install
-     * paths (generations, payloads, transaction temporaries) grow ~145 chars
-     * beyond this root, so a conditional prefix would split behavior by
-     * install depth. One uniform form also means every install exercises the
-     * exact path shape the deep-path guards verify. */
-    if (drive_absolute) {
-        if (length + 5U >= CBM_WINDOWS_LAUNCHER_PATH_CAP) {
-            return false;
-        }
-        wmemcpy(path, L"\\\\?\\", 4);
-        wmemcpy(path + 4, resolved, length + 1U);
-    } else {
-        wmemcpy(path, resolved, length + 1U);
-    }
-    return true;
-}
-
-/* User-facing form of a canonical wide path: agent configs, PATH advice, and
- * install messages must carry the classic drive form, never the \\?\\
- * namespace the file APIs use internally. */
-static char *cli_windows_plain_utf8(const wchar_t *path) {
-    if (path && wcsncmp(path, L"\\\\?\\", 4) == 0) {
-        path += 4;
-    }
-    return cbm_wide_to_utf8(path);
-}
-
-static bool cli_windows_module_path(wchar_t out[CBM_WINDOWS_LAUNCHER_PATH_CAP]) {
-    DWORD length = GetModuleFileNameW(NULL, out, CBM_WINDOWS_LAUNCHER_PATH_CAP);
-    return length > 0 && length < CBM_WINDOWS_LAUNCHER_PATH_CAP &&
-           cli_windows_canonicalize_launcher_path(out);
-}
-
-static bool cli_windows_parent_path(const wchar_t *path, wchar_t *out, size_t capacity) {
-    if (!path || !out || capacity == 0) {
-        return false;
-    }
-    out[0] = L'\0';
-    size_t length = wcslen(path);
-    if (length == 0 || length >= capacity) {
-        return false;
-    }
-    memcpy(out, path, (length + 1U) * sizeof(*out));
-    wchar_t *slash = wcsrchr(out, L'\\');
-    wchar_t *forward = wcsrchr(out, L'/');
-    if (forward && (!slash || forward > slash)) {
-        slash = forward;
-    }
-    if (!slash || slash == out) {
-        out[0] = L'\0';
-        return false;
-    }
-    *slash = L'\0';
-    return true;
-}
-
-static bool cli_windows_join_path(const wchar_t *directory, const wchar_t *name, wchar_t *out,
-                                  size_t capacity) {
-    if (!directory || !directory[0] || !name || !name[0] || !out || capacity == 0) {
-        return false;
-    }
-    int written = _snwprintf_s(out, capacity, _TRUNCATE, L"%ls\\%ls", directory, name);
-    if (written <= 0 || (size_t)written >= capacity) {
-        out[0] = L'\0';
-        return false;
-    }
-    /* Join targets feed file APIs and derived-path builders directly; only
-     * the full-capacity launcher buffers can hold the canonical form. */
-    if (capacity >= CBM_WINDOWS_LAUNCHER_PATH_CAP) {
-        return cli_windows_canonicalize_launcher_path(out);
-    }
-    return true;
-}
-
-static bool cli_windows_regular_file_no_reparse(const wchar_t *path, uint64_t *size_out) {
-    HANDLE file =
-        CreateFileW(path, GENERIC_READ | READ_CONTROL, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL,
-                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
-    BY_HANDLE_FILE_INFORMATION information;
-    LARGE_INTEGER size;
-    bool valid = file != INVALID_HANDLE_VALUE && GetFileType(file) == FILE_TYPE_DISK &&
-                 GetFileInformationByHandle(file, &information) != 0 &&
-                 (information.dwFileAttributes &
-                  (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0 &&
-                 information.nNumberOfLinks == 1 && GetFileSizeEx(file, &size) != 0 &&
-                 size.QuadPart > 0;
-    if (valid && size_out) {
-        *size_out = (uint64_t)size.QuadPart;
-    }
-    if (file != INVALID_HANDLE_VALUE) {
-        (void)CloseHandle(file);
-    }
-    return valid;
-}
-
-/* A portable release pair provides a one-link source launcher adjacent to the
- * payload. A managed reinstall must instead validate the canonical launcher's
- * exact two-link identity and copy from the backing that owns that identity.
- * The backing can intentionally differ from current-v1 during a crash-safe ABI
- * transition, so it is discovered by file identity rather than payload SHA. */
-static bool cli_windows_install_source_launcher(
-    const wchar_t *payload_path, wchar_t launcher_out[CBM_WINDOWS_LAUNCHER_PATH_CAP]) {
-    if (g_windows_launcher_context.present && g_windows_launcher_context.managed) {
-        char error[CLI_BUF_512] = {0};
-        if (cbm_windows_managed_launcher_backing(g_windows_launcher_context.canonical_launcher_path,
-                                                 launcher_out, CBM_WINDOWS_LAUNCHER_PATH_CAP, error,
-                                                 sizeof(error))) {
-            return true;
-        }
-        (void)fprintf(stderr, "error: managed launcher backing validation failed: %s\n",
-                      error[0] ? error : "canonical launcher is not an exact two-link pair");
-        return false;
-    }
-    wchar_t directory[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    return cli_windows_parent_path(payload_path, directory, CBM_WINDOWS_LAUNCHER_PATH_CAP) &&
-           cli_windows_join_path(directory, L"codebase-memory-mcp.exe", launcher_out,
-                                 CBM_WINDOWS_LAUNCHER_PATH_CAP) &&
-           cli_windows_regular_file_no_reparse(launcher_out, NULL);
-}
-
-static void cli_windows_remove_empty_managed_state(const wchar_t *canonical_launcher) {
-    wchar_t directory[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    wchar_t state[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    wchar_t generations[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    if (!cli_windows_parent_path(canonical_launcher, directory, CBM_WINDOWS_LAUNCHER_PATH_CAP) ||
-        !cli_windows_join_path(directory, L".cbm", state, CBM_WINDOWS_LAUNCHER_PATH_CAP) ||
-        !cli_windows_join_path(state, L"generations", generations, CBM_WINDOWS_LAUNCHER_PATH_CAP)) {
-        return;
-    }
-    /* Rollback already removed the exact generation and current-v1 created by
-     * this activation. Remove only now-empty parents: recursive cleanup could
-     * erase a pre-existing recovery generation that this attempt did not own. */
-    (void)RemoveDirectoryW(generations);
-    (void)RemoveDirectoryW(state);
-}
-
-static bool cli_windows_stage_private_file(const char *source, const char *target,
-                                           char fingerprint_out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]);
-static bool cli_windows_stage_private_bytes(
-    const unsigned char *bytes, size_t bytes_size, const char *target,
-    char fingerprint_out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]);
-
-static bool cli_windows_path_absent(const wchar_t *path) {
-    if (!path || !path[0]) {
-        return false;
-    }
-    DWORD attributes = GetFileAttributesW(path);
-    if (attributes != INVALID_FILE_ATTRIBUTES) {
-        return false;
-    }
-    DWORD error = GetLastError();
-    return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
-}
-
-static bool cli_windows_file_fingerprint_matches(const wchar_t *path,
-                                                 const char expected_sha256[65]) {
-    char *path_utf8 = cbm_wide_to_utf8(path);
-    char observed[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
-    bool matches = path_utf8 && expected_sha256 &&
-                   cbm_daemon_build_fingerprint_file(path_utf8, observed) &&
-                   strcmp(observed, expected_sha256) == 0;
-    free(path_utf8);
-    return matches;
-}
-
-static bool cli_windows_generation_launcher_secure(const wchar_t *canonical_launcher,
-                                                   const wchar_t *generation_launcher,
-                                                   const char expected_launcher_sha256[65]) {
-    wchar_t current_backing[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    char error[CLI_BUF_256] = {0};
-    bool managed_backing =
-        cbm_windows_managed_launcher_backing(canonical_launcher, current_backing,
-                                             CBM_WINDOWS_LAUNCHER_PATH_CAP, error, sizeof(error)) &&
-        _wcsicmp(current_backing, generation_launcher) == 0;
-    bool unpublished_backing = !managed_backing && cbm_windows_launcher_file_secure(
-                                                       generation_launcher, error, sizeof(error));
-    if (!managed_backing && !unpublished_backing) {
-        (void)fprintf(stderr, "error: generation launcher backing validation failed: %s (os %lu)\n",
-                      error[0] ? error : "no matching backing", (unsigned long)GetLastError());
-        return false;
-    }
-    if (!cli_windows_file_fingerprint_matches(generation_launcher, expected_launcher_sha256)) {
-        (void)fprintf(stderr, "error: generation launcher fingerprint mismatch (os %lu)\n",
-                      (unsigned long)GetLastError());
-        return false;
-    }
-    return true;
-}
-
-static bool cli_windows_generation_payload_secure(const wchar_t *payload,
-                                                  const cbm_windows_current_v1_t *state) {
-    uint64_t payload_size = 0;
-    char payload_error[CLI_BUF_256] = {0};
-    if (!state || !cli_windows_regular_file_no_reparse(payload, &payload_size)) {
-        (void)fprintf(stderr, "error: generation payload open/shape validation failed (os %lu)\n",
-                      (unsigned long)GetLastError());
-        return false;
-    }
-    if (payload_size != state->payload_size) {
-        (void)fprintf(stderr, "error: generation payload size mismatch\n");
-        return false;
-    }
-    if (!cbm_windows_launcher_file_secure(payload, payload_error, sizeof(payload_error))) {
-        (void)fprintf(stderr, "error: generation payload security validation failed: %s (os %lu)\n",
-                      payload_error[0] ? payload_error : "unsafe path or policy",
-                      (unsigned long)GetLastError());
-        return false;
-    }
-    if (!cli_windows_file_fingerprint_matches(payload, state->payload_sha256)) {
-        (void)fprintf(stderr, "error: generation payload fingerprint mismatch (os %lu)\n",
-                      (unsigned long)GetLastError());
-        return false;
-    }
-    return true;
-}
-
-static bool cli_windows_generation_pair_valid(const wchar_t *canonical_launcher,
-                                              const wchar_t *payload,
-                                              const wchar_t *generation_launcher,
-                                              const cbm_windows_current_v1_t *state,
-                                              const char expected_launcher_sha256[65]) {
-    return cli_windows_generation_payload_secure(payload, state) &&
-           cli_windows_generation_launcher_secure(canonical_launcher, generation_launcher,
-                                                  expected_launcher_sha256);
-}
-
-static void cli_windows_generation_pair_cleanup(const wchar_t *payload,
-                                                const wchar_t *generation_launcher,
-                                                const wchar_t *generation_directory,
-                                                bool payload_created, bool launcher_created,
-                                                bool directory_created) {
-    if (payload_created && payload && payload[0]) {
-        (void)DeleteFileW(payload);
-    }
-    if (launcher_created && generation_launcher && generation_launcher[0]) {
-        (void)DeleteFileW(generation_launcher);
-    }
-    if (directory_created && generation_directory && generation_directory[0]) {
-        (void)RemoveDirectoryW(generation_directory);
-    }
-}
-
-static bool cli_windows_generation_unreferenced_by_current(const wchar_t *canonical_launcher,
-                                                           const char payload_sha256[65]) {
-    cbm_windows_current_v1_t current;
-    bool exists = false;
-    return cli_windows_read_current(canonical_launcher, &current, &exists) &&
-           (!exists || strcmp(current.payload_sha256, payload_sha256) != 0);
-}
-
-static bool cli_windows_publish_generation(const wchar_t *canonical_launcher,
-                                           const wchar_t *launcher_source,
-                                           const wchar_t *payload_source,
-                                           const cbm_windows_current_v1_t *state,
-                                           bool *created_out) {
-    if (created_out) {
-        *created_out = false;
-    }
-    wchar_t payload[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    wchar_t generation_launcher[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    if (!launcher_source || !payload_source || !state ||
-        !cbm_windows_generation_payload_path(canonical_launcher, state->payload_sha256, payload,
-                                             CBM_WINDOWS_LAUNCHER_PATH_CAP) ||
-        !cbm_windows_generation_launcher_path(canonical_launcher, state->payload_sha256,
-                                              generation_launcher, CBM_WINDOWS_LAUNCHER_PATH_CAP)) {
-        (void)fprintf(stderr, "error: generation path construction failed (os %lu)\n",
-                      (unsigned long)GetLastError());
-        return false;
-    }
-    char *launcher_source_utf8 = cbm_wide_to_utf8(launcher_source);
-    char expected_launcher_sha256[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
-    bool launcher_identity =
-        launcher_source_utf8 &&
-        cbm_daemon_build_fingerprint_file(launcher_source_utf8, expected_launcher_sha256);
-    free(launcher_source_utf8);
-    if (!launcher_identity) {
-        (void)fprintf(stderr, "error: launcher build-identity fingerprint failed (os %lu)\n",
-                      (unsigned long)GetLastError());
-        return false;
-    }
-    bool payload_absent = cli_windows_path_absent(payload);
-    bool launcher_absent = cli_windows_path_absent(generation_launcher);
-    if (!payload_absent && !launcher_absent) {
-        bool pair_valid = cli_windows_generation_pair_valid(
-            canonical_launcher, payload, generation_launcher, state, expected_launcher_sha256);
-        if (!pair_valid) {
-            (void)fprintf(stderr, "error: existing generation pair failed validation (os %lu)\n",
-                          (unsigned long)GetLastError());
-        }
-        return pair_valid;
-    }
-    bool fresh_generation = payload_absent && launcher_absent;
-    if (!cli_windows_generation_unreferenced_by_current(canonical_launcher,
-                                                        state->payload_sha256)) {
-        (void)fprintf(stderr, "error: generation is still referenced by current state (os %lu)\n",
-                      (unsigned long)GetLastError());
-        return false;
-    }
-    if (!fresh_generation) {
-        bool existing_secure =
-            payload_absent ? cli_windows_generation_launcher_secure(
-                                 canonical_launcher, generation_launcher, expected_launcher_sha256)
-                           : cli_windows_generation_payload_secure(payload, state);
-        if (!existing_secure) {
-            (void)fprintf(stderr, "error: partial generation failed security validation (os %lu)\n",
-                          (unsigned long)GetLastError());
-            return false;
-        }
-    }
-
-    wchar_t generation_dir[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    if (!cli_windows_parent_path(payload, generation_dir, CBM_WINDOWS_LAUNCHER_PATH_CAP)) {
-        (void)fprintf(stderr, "error: generation directory path construction failed (os %lu)\n",
-                      (unsigned long)GetLastError());
-        return false;
-    }
-    char *generation_dir_utf8 = cbm_wide_to_utf8(generation_dir);
-    char *payload_utf8 = cbm_wide_to_utf8(payload);
-    char *generation_launcher_utf8 = cbm_wide_to_utf8(generation_launcher);
-    char *payload_source_utf8 = cbm_wide_to_utf8(payload_source);
-    launcher_source_utf8 = cbm_wide_to_utf8(launcher_source);
-    bool generation_directory_absent = cli_windows_path_absent(generation_dir);
-    bool prepared = generation_dir_utf8 && payload_utf8 && generation_launcher_utf8 &&
-                    payload_source_utf8 && launcher_source_utf8 &&
-                    cbm_mkdir_p(generation_dir_utf8, CLI_OCTAL_PERM);
-    if (!prepared) {
-        (void)fprintf(stderr, "error: generation directory creation failed (os %lu)\n",
-                      (unsigned long)GetLastError());
-    }
-    char payload_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
-    char launcher_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
-    bool payload_created = false;
-    bool launcher_created = false;
-    if (prepared && payload_absent) {
-        payload_created =
-            cli_windows_stage_private_file(payload_source_utf8, payload_utf8, payload_fingerprint);
-        prepared = payload_created && strcmp(payload_fingerprint, state->payload_sha256) == 0;
-        if (payload_created && !prepared) {
-            (void)fprintf(stderr, "error: staged payload fingerprint mismatch\n");
-        }
-    }
-    if (prepared && launcher_absent) {
-        launcher_created = cli_windows_stage_private_file(
-            launcher_source_utf8, generation_launcher_utf8, launcher_fingerprint);
-        prepared = launcher_created && strcmp(launcher_fingerprint, expected_launcher_sha256) == 0;
-        if (launcher_created && !prepared) {
-            (void)fprintf(stderr, "error: staged launcher fingerprint mismatch\n");
-        }
-    }
-    if (prepared) {
-        prepared = cli_windows_generation_pair_valid(
-            canonical_launcher, payload, generation_launcher, state, expected_launcher_sha256);
-        if (!prepared) {
-            (void)fprintf(stderr,
-                          "error: published generation pair failed final validation (os %lu)\n",
-                          (unsigned long)GetLastError());
-        }
-    }
-    free(generation_dir_utf8);
-    free(payload_utf8);
-    free(generation_launcher_utf8);
-    free(payload_source_utf8);
-    free(launcher_source_utf8);
-    if (!prepared) {
-        cli_windows_generation_pair_cleanup(payload, generation_launcher, generation_dir,
-                                            payload_created, launcher_created,
-                                            generation_directory_absent);
-        return false;
-    }
-    if (created_out) {
-        *created_out = fresh_generation;
-    }
-    return prepared;
-}
-
-static bool cli_windows_publish_generation_bytes(const wchar_t *canonical_launcher,
-                                                 const cbm_windows_current_v1_t *state,
-                                                 const unsigned char *launcher,
-                                                 size_t launcher_size, const unsigned char *payload,
-                                                 size_t payload_size, bool *created_out) {
-    if (created_out) {
-        *created_out = false;
-    }
-    if (!state || !launcher || launcher_size == 0 || !payload || payload_size == 0 ||
-        payload_size != state->payload_size) {
-        return false;
-    }
-    wchar_t generation_payload[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    wchar_t generation_launcher[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    if (!cbm_windows_generation_payload_path(canonical_launcher, state->payload_sha256,
-                                             generation_payload, CBM_WINDOWS_LAUNCHER_PATH_CAP) ||
-        !cbm_windows_generation_launcher_path(canonical_launcher, state->payload_sha256,
-                                              generation_launcher, CBM_WINDOWS_LAUNCHER_PATH_CAP)) {
-        return false;
-    }
-    char expected_launcher_sha256[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
-    cbm_sha256_hex(launcher, launcher_size, expected_launcher_sha256);
-    bool payload_absent = cli_windows_path_absent(generation_payload);
-    bool launcher_absent = cli_windows_path_absent(generation_launcher);
-    if (!payload_absent && !launcher_absent) {
-        return cli_windows_generation_pair_valid(canonical_launcher, generation_payload,
-                                                 generation_launcher, state,
-                                                 expected_launcher_sha256);
-    }
-    bool fresh_generation = payload_absent && launcher_absent;
-    if (!cli_windows_generation_unreferenced_by_current(canonical_launcher,
-                                                        state->payload_sha256)) {
-        return false;
-    }
-    if (!fresh_generation) {
-        bool existing_secure =
-            payload_absent ? cli_windows_generation_launcher_secure(
-                                 canonical_launcher, generation_launcher, expected_launcher_sha256)
-                           : cli_windows_generation_payload_secure(generation_payload, state);
-        if (!existing_secure) {
-            return false;
-        }
-    }
-    wchar_t generation_directory[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    if (!cli_windows_parent_path(generation_payload, generation_directory,
-                                 CBM_WINDOWS_LAUNCHER_PATH_CAP)) {
-        return false;
-    }
-    char *directory_utf8 = cbm_wide_to_utf8(generation_directory);
-    char *payload_utf8 = cbm_wide_to_utf8(generation_payload);
-    char *launcher_utf8 = cbm_wide_to_utf8(generation_launcher);
-    bool generation_directory_absent = cli_windows_path_absent(generation_directory);
-    bool ready = directory_utf8 && payload_utf8 && launcher_utf8 &&
-                 cbm_mkdir_p(directory_utf8, CLI_OCTAL_PERM);
-    char payload_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
-    char launcher_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
-    bool payload_created = false;
-    bool launcher_created = false;
-    if (ready && payload_absent) {
-        payload_created = cli_windows_stage_private_bytes(payload, payload_size, payload_utf8,
-                                                          payload_fingerprint);
-        ready = payload_created && strcmp(payload_fingerprint, state->payload_sha256) == 0;
-    }
-    if (ready && launcher_absent) {
-        launcher_created = cli_windows_stage_private_bytes(launcher, launcher_size, launcher_utf8,
-                                                           launcher_fingerprint);
-        ready = launcher_created && strcmp(launcher_fingerprint, expected_launcher_sha256) == 0;
-    }
-    ready = ready &&
-            cli_windows_generation_pair_valid(canonical_launcher, generation_payload,
-                                              generation_launcher, state, expected_launcher_sha256);
-    free(directory_utf8);
-    free(payload_utf8);
-    free(launcher_utf8);
-    if (!ready) {
-        cli_windows_generation_pair_cleanup(generation_payload, generation_launcher,
-                                            generation_directory, payload_created, launcher_created,
-                                            generation_directory_absent);
-        return false;
-    }
-    if (created_out) {
-        *created_out = fresh_generation;
-    }
-    return ready;
-}
 #endif
 
-/* ── Tar.gz extraction ────────────────────────────────────────── */
+/* ── Tar.gz / zip extraction (TEST-ONLY) ──────────────────────────
+ *
+ * The only callers of this block are the in-process updater — already excluded
+ * from release builds — and tests/test_cli.c. The DEFINITIONS were nevertheless
+ * unguarded, so every shipped binary carried a complete archive extractor with
+ * no way to reach it: the translation unit is compiled and linked whole, with no
+ * LTO or function-section garbage collection to drop it.
+ *
+ * "Download an archive, decompress it in memory, pick an executable out of it,
+ * write it to disk and mark it executable" is the canonical dropper composite.
+ * We do not do that in production, and now we cannot: the capability is not in
+ * the artifact rather than merely unreachable within it. Verified by
+ * scripts/ci/check-binary-composition.sh.
+ */
+#ifdef CBM_CLI_ENABLE_TEST_API
 
 /* Decompress gzip data into a malloc'd buffer. Returns NULL on failure.
  * *out_total receives the decompressed size. Caller must free the result. */
@@ -6468,259 +6526,7 @@ unsigned char *cbm_extract_binary_from_zip(const unsigned char *data, int data_l
     return NULL;
 }
 
-enum {
-    ZIP_CENTRAL_HDR_SZ = 46,
-    ZIP_END_HDR_SZ = 22,
-    ZIP_OFF_FLAGS = 6,
-    ZIP_OFF_CRC = 14,
-    ZIP_CENTRAL_OFF_FLAGS = 8,
-    ZIP_CENTRAL_OFF_METHOD = 10,
-    ZIP_CENTRAL_OFF_CRC = 16,
-    ZIP_CENTRAL_OFF_COMP = 20,
-    ZIP_CENTRAL_OFF_UNCOMP = 24,
-    ZIP_CENTRAL_OFF_NAMELEN = 28,
-    ZIP_CENTRAL_OFF_EXTRALEN = 30,
-    ZIP_CENTRAL_OFF_COMMENTLEN = 32,
-    ZIP_CENTRAL_OFF_DISK = 34,
-    ZIP_CENTRAL_OFF_LOCAL = 42,
-    ZIP_END_OFF_DISK = 4,
-    ZIP_END_OFF_CENTRAL_DISK = 6,
-    ZIP_END_OFF_ENTRIES_DISK = 8,
-    ZIP_END_OFF_ENTRIES_TOTAL = 10,
-    ZIP_END_OFF_CENTRAL_SIZE = 12,
-    ZIP_END_OFF_CENTRAL_OFFSET = 16,
-    ZIP_END_OFF_COMMENTLEN = 20,
-    ZIP_UTF8_FLAG = 0x0800,
-};
-
-static bool zip_signature_is(const unsigned char *data, size_t offset, size_t length,
-                             unsigned char third, unsigned char fourth) {
-    return offset <= length && length - offset >= 4U && data[offset] == 0x50 &&
-           data[offset + 1U] == 0x4b && data[offset + 2U] == third && data[offset + 3U] == fourth;
-}
-
-static bool zip_find_end_record(const unsigned char *data, size_t length, size_t *offset_out) {
-    if (length < ZIP_END_HDR_SZ || !offset_out) {
-        return false;
-    }
-    size_t floor =
-        length > UINT16_MAX + ZIP_END_HDR_SZ ? length - (UINT16_MAX + ZIP_END_HDR_SZ) : 0;
-    for (size_t offset = length - ZIP_END_HDR_SZ;; offset--) {
-        if (zip_signature_is(data, offset, length, 0x05, 0x06)) {
-            uint16_t comment = zip_read_u16le(data + offset + ZIP_END_OFF_COMMENTLEN);
-            if (offset + ZIP_END_HDR_SZ + comment == length) {
-                *offset_out = offset;
-                return true;
-            }
-        }
-        if (offset == floor) {
-            break;
-        }
-    }
-    return false;
-}
-
-static bool zip_ascii_equal_folded(const unsigned char *name, size_t name_length,
-                                   const char *expected) {
-    size_t expected_length = strlen(expected);
-    if (name_length != expected_length) {
-        return false;
-    }
-    for (size_t index = 0; index < name_length; index++) {
-        unsigned char left = name[index];
-        unsigned char right = (unsigned char)expected[index];
-        if (left >= 'A' && left <= 'Z') {
-            left = (unsigned char)(left - 'A' + 'a');
-        }
-        if (right >= 'A' && right <= 'Z') {
-            right = (unsigned char)(right - 'A' + 'a');
-        }
-        if (left != right) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static int zip_windows_bundle_name_kind(const unsigned char *name, size_t name_length) {
-    static const char *const allowed[] = {
-        NULL,          "codebase-memory-mcp.exe", "codebase-memory-mcp.payload.exe", "LICENSE",
-        "install.ps1", "THIRD_PARTY_NOTICES.md",
-    };
-    if (!name || name_length == 0 || name[name_length - 1U] == '.' ||
-        name[name_length - 1U] == ' ') {
-        return 0;
-    }
-    for (size_t index = 0; index < name_length; index++) {
-        if (name[index] == '\0' || name[index] == '/' || name[index] == '\\' ||
-            name[index] == ':') {
-            return 0;
-        }
-    }
-    for (size_t kind = 1U; kind < sizeof(allowed) / sizeof(allowed[0]); kind++) {
-        const char *expected = allowed[kind];
-        if (zip_ascii_equal_folded(name, name_length, expected)) {
-            return name_length == strlen(expected) && memcmp(name, expected, name_length) == 0
-                       ? (int)kind
-                       : -1;
-        }
-    }
-    return 0;
-}
-
-void cbm_windows_release_pair_free(cbm_windows_release_pair_t *pair) {
-    if (pair) {
-        free(pair->launcher);
-        free(pair->payload);
-        memset(pair, 0, sizeof(*pair));
-    }
-}
-
-bool cbm_extract_windows_release_pair_from_zip(const unsigned char *data, int data_len,
-                                               cbm_windows_release_pair_t *pair_out) {
-    if (!data || data_len <= 0 || !pair_out) {
-        return false;
-    }
-    memset(pair_out, 0, sizeof(*pair_out));
-    size_t length = (size_t)data_len;
-    size_t end_offset = 0;
-    if (!zip_find_end_record(data, length, &end_offset)) {
-        return false;
-    }
-    const unsigned char *end = data + end_offset;
-    uint16_t entries_disk = zip_read_u16le(end + ZIP_END_OFF_ENTRIES_DISK);
-    uint16_t entries_total = zip_read_u16le(end + ZIP_END_OFF_ENTRIES_TOTAL);
-    uint32_t central_size = zip_read_u32le(end + ZIP_END_OFF_CENTRAL_SIZE);
-    uint32_t central_offset = zip_read_u32le(end + ZIP_END_OFF_CENTRAL_OFFSET);
-    if (zip_read_u16le(end + ZIP_END_OFF_DISK) != 0 ||
-        zip_read_u16le(end + ZIP_END_OFF_CENTRAL_DISK) != 0 || entries_disk != 5 ||
-        entries_total != 5 || central_offset > end_offset ||
-        central_size != end_offset - central_offset) {
-        return false;
-    }
-
-    size_t cursor = central_offset;
-    bool seen[6] = {false, false, false, false, false, false};
-    size_t local_starts[5] = {0, 0, 0, 0, 0};
-    size_t local_ends[5] = {0, 0, 0, 0, 0};
-    for (uint16_t entry = 0; entry < entries_total; entry++) {
-        if (!zip_signature_is(data, cursor, length, 0x01, 0x02) ||
-            length - cursor < ZIP_CENTRAL_HDR_SZ) {
-            cbm_windows_release_pair_free(pair_out);
-            return false;
-        }
-        const unsigned char *central = data + cursor;
-        uint16_t flags = zip_read_u16le(central + ZIP_CENTRAL_OFF_FLAGS);
-        uint16_t method = zip_read_u16le(central + ZIP_CENTRAL_OFF_METHOD);
-        uint32_t crc = zip_read_u32le(central + ZIP_CENTRAL_OFF_CRC);
-        uint32_t compressed = zip_read_u32le(central + ZIP_CENTRAL_OFF_COMP);
-        uint32_t uncompressed = zip_read_u32le(central + ZIP_CENTRAL_OFF_UNCOMP);
-        uint16_t name_length = zip_read_u16le(central + ZIP_CENTRAL_OFF_NAMELEN);
-        uint16_t extra_length = zip_read_u16le(central + ZIP_CENTRAL_OFF_EXTRALEN);
-        uint16_t comment_length = zip_read_u16le(central + ZIP_CENTRAL_OFF_COMMENTLEN);
-        uint32_t local_offset = zip_read_u32le(central + ZIP_CENTRAL_OFF_LOCAL);
-        size_t central_record_size = ZIP_CENTRAL_HDR_SZ + (size_t)name_length +
-                                     (size_t)extra_length + (size_t)comment_length;
-        if (name_length == 0 || central_record_size > end_offset - cursor ||
-            zip_read_u16le(central + ZIP_CENTRAL_OFF_DISK) != 0 ||
-            (flags & (uint16_t)~ZIP_UTF8_FLAG) != 0 ||
-            (method != ZIP_STORED && method != ZIP_DEFLATE)) {
-            cbm_windows_release_pair_free(pair_out);
-            return false;
-        }
-        const unsigned char *name = central + ZIP_CENTRAL_HDR_SZ;
-        int kind = zip_windows_bundle_name_kind(name, name_length);
-        if (kind <= 0 || seen[kind]) {
-            cbm_windows_release_pair_free(pair_out);
-            return false;
-        }
-        seen[kind] = true;
-
-        if (local_offset >= central_offset ||
-            !zip_signature_is(data, local_offset, length, 0x03, 0x04) ||
-            central_offset - local_offset < ZIP_HDR_SZ) {
-            cbm_windows_release_pair_free(pair_out);
-            return false;
-        }
-        const unsigned char *local = data + local_offset;
-        uint16_t local_flags = zip_read_u16le(local + ZIP_OFF_FLAGS);
-        uint16_t local_method = zip_read_u16le(local + ZIP_OFF_METHOD);
-        uint32_t local_crc = zip_read_u32le(local + ZIP_OFF_CRC);
-        uint32_t local_compressed = zip_read_u32le(local + ZIP_OFF_COMP);
-        uint32_t local_uncompressed = zip_read_u32le(local + ZIP_OFF_UNCOMP);
-        uint16_t local_name_length = zip_read_u16le(local + ZIP_OFF_NAMELEN);
-        uint16_t local_extra_length = zip_read_u16le(local + ZIP_OFF_EXTRALEN);
-        size_t data_offset = (size_t)local_offset + ZIP_HDR_SZ + (size_t)local_name_length +
-                             (size_t)local_extra_length;
-        if (local_flags != flags || local_method != method || local_crc != crc ||
-            local_compressed != compressed || local_uncompressed != uncompressed ||
-            local_name_length != name_length || data_offset > central_offset ||
-            compressed > central_offset - data_offset ||
-            memcmp(local + ZIP_HDR_SZ, name, name_length) != 0) {
-            cbm_windows_release_pair_free(pair_out);
-            return false;
-        }
-        size_t local_end = data_offset + compressed;
-        for (uint16_t prior = 0; prior < entry; prior++) {
-            if (local_offset < local_ends[prior] && local_end > local_starts[prior]) {
-                cbm_windows_release_pair_free(pair_out);
-                return false;
-            }
-        }
-        local_starts[entry] = local_offset;
-        local_ends[entry] = local_end;
-        int extracted_length = 0;
-        unsigned char *extracted = zip_extract_entry(data + data_offset, method, compressed,
-                                                     uncompressed, &extracted_length);
-        uLong observed_crc = extracted ? crc32(0L, extracted, (uInt)extracted_length) : 0;
-        if (!extracted || extracted_length <= 0 || (uint32_t)extracted_length != uncompressed ||
-            observed_crc != crc) {
-            free(extracted);
-            cbm_windows_release_pair_free(pair_out);
-            return false;
-        }
-        if (kind == 1) {
-            pair_out->launcher = extracted;
-            pair_out->launcher_len = extracted_length;
-        } else if (kind == 2) {
-            pair_out->payload = extracted;
-            pair_out->payload_len = extracted_length;
-        } else {
-            /* Legal/install metadata is part of the authenticated release
-             * namespace but is never materialized by the updater. Parsing,
-             * bounds checks, and CRC verification above still cover it. */
-            free(extracted);
-        }
-        cursor += central_record_size;
-    }
-    for (size_t index = 1U; index < 5U; index++) {
-        size_t start = local_starts[index];
-        size_t end_value = local_ends[index];
-        size_t position = index;
-        while (position > 0U && local_starts[position - 1U] > start) {
-            local_starts[position] = local_starts[position - 1U];
-            local_ends[position] = local_ends[position - 1U];
-            position--;
-        }
-        local_starts[position] = start;
-        local_ends[position] = end_value;
-    }
-    bool namespace_complete = true;
-    for (size_t kind = 1U; kind < 6U; kind++) {
-        namespace_complete = namespace_complete && seen[kind];
-    }
-    bool local_records_contiguous = local_starts[0] == 0U;
-    for (size_t index = 1U; index < 5U; index++) {
-        local_records_contiguous =
-            local_records_contiguous && local_ends[index - 1U] == local_starts[index];
-    }
-    if (cursor != end_offset || !namespace_complete || !local_records_contiguous ||
-        local_ends[4] != central_offset) {
-        cbm_windows_release_pair_free(pair_out);
-        return false;
-    }
-    return true;
-}
+#endif /* CBM_CLI_ENABLE_TEST_API — tar.gz / zip extraction */
 
 /* ── Index management ─────────────────────────────────────────── */
 
@@ -6933,8 +6739,108 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key) {
 
 /* ── Config CLI subcommand ────────────────────────────────────── */
 
+/* THE config-key table. list, get, help, and key validation all read this one
+ * definition, so a key cannot exist with different defaults in different
+ * subcommands again: `config list` used to print stored-or-DEFAULT while
+ * `config get` printed stored-or-EMPTY — every unset key (and every typo'd
+ * key, at exit 0) "got" an empty string, indistinguishable from a real value
+ * (#1522). The defaults here mirror the runtime readers' fallbacks
+ * (cbm_config_get_bool/int call sites); keep them in sync. */
+typedef struct {
+    const char *key;
+    const char *default_value;
+    const char *help;
+} config_key_def_t;
+
+static const config_key_def_t CONFIG_KEYS[] = {
+    {CBM_CONFIG_AUTO_INDEX, "false", "Enable auto-indexing on MCP session start"},
+    {CBM_CONFIG_AUTO_INDEX_LIMIT, "50000", "Max files for auto-indexing new projects"},
+    {CBM_CONFIG_AUTO_WATCH, "true", "Register background git watcher on session connect"},
+    {CBM_CONFIG_UI_LANG, "auto", "Pin graph UI language: en, zh, or auto"},
+    {CBM_CONFIG_UI_ENABLED, "false", "Serve the graph UI on a loopback HTTP port"},
+    {CBM_CONFIG_UI_PORT, "9749", "Port for the graph UI listener when enabled"},
+};
+
+/* #1558: ui_enabled and ui_port were reachable ONLY by hand-editing
+ * ~/.cache/codebase-memory-mcp/config.json. They were absent from CONFIG_KEYS,
+ * so `config list` could not show them and `config set` rejected them — while
+ * ui_enabled governs a loopback HTTP listener. A user who wants that surface
+ * off should not have to read our source to find the switch, and a reporter
+ * spent two debugging sessions doing exactly that.
+ *
+ * They live in a separate file (cbm_ui_config_load/save), not the key-value
+ * store the other keys use, so exposing them means routing rather than just
+ * listing them. */
+#ifdef CBM_CLI_ENABLE_TEST_API
+size_t cbm_cli_config_key_count_for_testing(void) {
+    return sizeof(CONFIG_KEYS) / sizeof(CONFIG_KEYS[0]);
+}
+const char *cbm_cli_config_key_at_for_testing(size_t index) {
+    return index < sizeof(CONFIG_KEYS) / sizeof(CONFIG_KEYS[0]) ? CONFIG_KEYS[index].key : NULL;
+}
+#endif
+
+static bool config_key_is_ui(const char *key) {
+    return key && (strcmp(key, CBM_CONFIG_UI_ENABLED) == 0 || strcmp(key, CBM_CONFIG_UI_PORT) == 0);
+}
+
+static void config_ui_read(const char *key, char *out, size_t out_sz) {
+    cbm_ui_config_t ui;
+    cbm_ui_config_load(&ui);
+    if (strcmp(key, CBM_CONFIG_UI_ENABLED) == 0) {
+        snprintf(out, out_sz, "%s", ui.ui_enabled ? "true" : "false");
+    } else {
+        snprintf(out, out_sz, "%d", ui.ui_port);
+    }
+}
+
+static int config_ui_write(const char *key, const char *value) {
+    cbm_ui_config_t ui;
+    cbm_ui_config_load(&ui);
+    if (strcmp(key, CBM_CONFIG_UI_ENABLED) == 0) {
+        if (strcmp(value, "true") != 0 && strcmp(value, "false") != 0) {
+            (void)fprintf(stderr, "error: %s must be true or false\n", key);
+            return CLI_ERR;
+        }
+        ui.ui_enabled = strcmp(value, "true") == 0;
+    } else {
+        char *end = NULL;
+        long port = strtol(value, &end, 10);
+        if (!end || *end || port < 1 || port > 65535) {
+            (void)fprintf(stderr, "error: %s must be a port between 1 and 65535\n", key);
+            return CLI_ERR;
+        }
+        ui.ui_port = (int)port;
+    }
+    if (!cbm_ui_config_save(&ui)) {
+        (void)fprintf(stderr, "error: could not write the UI configuration file\n");
+        return CLI_ERR;
+    }
+    return CLI_OK;
+}
+
+static const config_key_def_t *config_key_lookup(const char *key) {
+    for (size_t i = 0; key && i < sizeof(CONFIG_KEYS) / sizeof(CONFIG_KEYS[0]); i++) {
+        if (strcmp(CONFIG_KEYS[i].key, key) == 0) {
+            return &CONFIG_KEYS[i];
+        }
+    }
+    return NULL;
+}
+
+static void config_print_unknown_key(const char *key) {
+    (void)fprintf(stderr, "error: unknown config key: %s\nKnown keys:", key ? key : "");
+    for (size_t i = 0; i < sizeof(CONFIG_KEYS) / sizeof(CONFIG_KEYS[0]); i++) {
+        (void)fprintf(stderr, " %s", CONFIG_KEYS[i].key);
+    }
+    (void)fprintf(stderr, "\n");
+}
+
 int cbm_cmd_config(int argc, char **argv) {
-    if (argc == 0 || (argv && (strcmp(argv[0], "--help") == 0 || strcmp(argv[0], "-h") == 0))) {
+    /* NULL argv with a nonzero argc previously slipped past this guard (the
+     * inner `argv &&` shielded only the help comparison) and dereferenced
+     * argv[0] below -- caught by the clang-analyzer lane. */
+    if (argc == 0 || !argv || strcmp(argv[0], "--help") == 0 || strcmp(argv[0], "-h") == 0) {
         printf("Usage: codebase-memory-mcp config <command> [args]\n\n");
         printf("Commands:\n");
         printf("  list             Show all config values\n");
@@ -6942,14 +6848,10 @@ int cbm_cmd_config(int argc, char **argv) {
         printf("  set <key> <val>  Set a config value\n");
         printf("  reset <key>      Reset a key to default\n\n");
         printf("Config keys:\n");
-        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_INDEX, "false",
-               "Enable auto-indexing on MCP session start");
-        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_INDEX_LIMIT, "50000",
-               "Max files for auto-indexing new projects");
-        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_WATCH, "true",
-               "Register background git watcher on session connect");
-        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_UI_LANG, "auto",
-               "Pin graph UI language: en, zh, or auto");
+        for (size_t i = 0; i < sizeof(CONFIG_KEYS) / sizeof(CONFIG_KEYS[0]); i++) {
+            printf("  %-25s  default=%-10s  %s\n", CONFIG_KEYS[i].key, CONFIG_KEYS[i].default_value,
+                   CONFIG_KEYS[i].help);
+        }
         return 0;
     }
 
@@ -6971,25 +6873,53 @@ int cbm_cmd_config(int argc, char **argv) {
     int rc = 0;
     if (strcmp(argv[0], "list") == 0 || strcmp(argv[0], "ls") == 0) {
         printf("Configuration:\n");
-        printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_INDEX,
-               cbm_config_get(cfg, CBM_CONFIG_AUTO_INDEX, "false"));
-        printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_INDEX_LIMIT,
-               cbm_config_get(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "50000"));
-        printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_WATCH,
-               cbm_config_get(cfg, CBM_CONFIG_AUTO_WATCH, "true"));
-        printf("  %-25s = %-10s\n", CBM_CONFIG_UI_LANG,
-               cbm_config_get(cfg, CBM_CONFIG_UI_LANG, "auto"));
+        for (size_t i = 0; i < sizeof(CONFIG_KEYS) / sizeof(CONFIG_KEYS[0]); i++) {
+            char ui_value[CLI_BUF_1K];
+            const char *shown;
+            if (config_key_is_ui(CONFIG_KEYS[i].key)) {
+                config_ui_read(CONFIG_KEYS[i].key, ui_value, sizeof(ui_value));
+                shown = ui_value;
+            } else {
+                shown = cbm_config_get(cfg, CONFIG_KEYS[i].key, CONFIG_KEYS[i].default_value);
+            }
+            printf("  %-25s = %-10s\n", CONFIG_KEYS[i].key, shown);
+        }
     } else if (strcmp(argv[0], "get") == 0) {
         if (argc < MIN_ARGC_GET) {
             (void)fprintf(stderr, "Usage: config get <key>\n");
             rc = CLI_TRUE;
         } else {
-            printf("%s\n", cbm_config_get(cfg, argv[CLI_SKIP_ONE], ""));
+            const config_key_def_t *def = config_key_lookup(argv[CLI_SKIP_ONE]);
+            if (!def) {
+                config_print_unknown_key(argv[CLI_SKIP_ONE]);
+                rc = CLI_TRUE;
+            } else {
+                /* Stored value or the key's real default — the same fallback
+                 * the runtime readers use. `""` here was #1522's bug 2: every
+                 * unset key read as empty with exit 0. */
+                if (config_key_is_ui(def->key)) {
+                    char ui_value[CLI_BUF_1K];
+                    config_ui_read(def->key, ui_value, sizeof(ui_value));
+                    printf("%s\n", ui_value);
+                } else {
+                    printf("%s\n", cbm_config_get(cfg, def->key, def->default_value));
+                }
+            }
         }
     } else if (strcmp(argv[0], "set") == 0) {
         if (argc < MIN_ARGC_CMD) {
             (void)fprintf(stderr, "Usage: config set <key> <value>\n");
             rc = CLI_TRUE;
+        } else if (!config_key_lookup(argv[CLI_SKIP_ONE])) {
+            config_print_unknown_key(argv[CLI_SKIP_ONE]);
+            rc = CLI_TRUE;
+        } else if (config_key_is_ui(argv[CLI_SKIP_ONE])) {
+            if (config_ui_write(argv[CLI_SKIP_ONE], argv[CLI_PAIR_LEN]) == CLI_OK) {
+                printf("%s = %s\n", argv[CLI_SKIP_ONE], argv[CLI_PAIR_LEN]);
+                printf("  (restart the daemon for this to take effect)\n");
+            } else {
+                rc = CLI_TRUE;
+            }
         } else {
             if (cbm_config_set(cfg, argv[CLI_SKIP_ONE], argv[CLI_PAIR_LEN]) == 0) {
                 printf("%s = %s\n", argv[CLI_SKIP_ONE], argv[CLI_PAIR_LEN]);
@@ -7002,6 +6932,16 @@ int cbm_cmd_config(int argc, char **argv) {
         if (argc < MIN_ARGC_GET) {
             (void)fprintf(stderr, "Usage: config reset <key>\n");
             rc = CLI_TRUE;
+        } else if (!config_key_lookup(argv[CLI_SKIP_ONE])) {
+            config_print_unknown_key(argv[CLI_SKIP_ONE]);
+            rc = CLI_TRUE;
+        } else if (config_key_is_ui(argv[CLI_SKIP_ONE])) {
+            const config_key_def_t *def = config_key_lookup(argv[CLI_SKIP_ONE]);
+            if (config_ui_write(argv[CLI_SKIP_ONE], def->default_value) == CLI_OK) {
+                printf("%s reset to default\n", argv[CLI_SKIP_ONE]);
+            } else {
+                rc = CLI_TRUE;
+            }
         } else {
             cbm_config_delete(cfg, argv[CLI_SKIP_ONE]);
             printf("%s reset to default\n", argv[CLI_SKIP_ONE]);
@@ -7264,6 +7204,7 @@ int cbm_cli_checksum_manifest_digest(const char *manifest_path, const char *arch
 
 /* ── Download helper (shell-free curl via exec) ───────────────── */
 
+#ifdef CBM_CLI_ENABLE_TEST_API
 static bool cli_download_is_explicit_file_override(const char *url) {
     char override_buffer[CLI_BUF_512];
     const char *override =
@@ -7287,6 +7228,7 @@ static const char *cli_download_protocol(const char *url) {
     return NULL;
 }
 
+/* Download primitives: update was their only caller. */
 static int cbm_download_to_file(const char *url, const char *dest) {
     const char *protocol = cli_download_protocol(url);
     if (!protocol || !dest) {
@@ -7315,6 +7257,8 @@ static int cbm_download_to_file_quiet(const char *url, const char *dest) {
     return cbm_exec_no_shell(argv);
 }
 
+#endif /* CBM_CLI_ENABLE_TEST_API */
+
 /* ── macOS ad-hoc signing ─────────────────────────────────────── */
 
 #ifdef __APPLE__
@@ -7329,6 +7273,7 @@ static int cbm_macos_adhoc_sign(const char *binary_path) {
 }
 #endif
 
+#ifdef CBM_CLI_ENABLE_TEST_API
 /* Download checksums.txt and verify the archive integrity. Every non-zero
  * result is a fail-closed refusal; verification is never optional. */
 static int verify_download_checksum(const char *archive_path, const char *archive_name) {
@@ -7407,8 +7352,11 @@ static int verify_download_checksum(const char *archive_path, const char *archiv
     return 0;
 }
 
+#endif /* CBM_CLI_ENABLE_TEST_API */
+
 /* ── Detect OS/arch for download URL ──────────────────────────── */
 
+#ifdef CBM_CLI_ENABLE_TEST_API
 static const char *detect_os(void) {
 #ifdef _WIN32
     return "windows";
@@ -7426,6 +7374,8 @@ static const char *detect_arch(void) {
     return "amd64";
 #endif
 }
+
+#endif /* CBM_CLI_ENABLE_TEST_API */
 
 /* ── Agent config install/refresh (shared by install + update) ── */
 
@@ -7520,12 +7470,63 @@ static void plan_record(const char *agent, const char *kind, const char *path) {
     snprintf(e->path, sizeof(e->path), "%s", path);
 }
 
-static void record_agent_config_error(bool uninstalling, const char *agent, const char *operation,
-                                      const char *path) {
+/* Describe what the target actually IS, so a refusal is triageable.
+ *
+ * The config editors collapse nine distinct fail-closed conditions into a
+ * single -1: unsupported structure, an inline comment on a field line, a
+ * non-single-link file, unsafe metadata, lock contention, I/O. `agent=X op=Y
+ * path=Z` alone cannot separate them, and four such failures currently live in
+ * discussion #1560 with no way to tell them apart — OpenCode and Hermes on two
+ * operating systems, unresolved across five releases.
+ *
+ * This reports only OBSERVED facts about the path, never a guess. In
+ * particular it does NOT print errno: this function is called from 119 sites
+ * and errno may be stale from an unrelated call, which is exactly the defect
+ * fixed in #1537, where a permission decision surfaced a fabricated ENOENT and
+ * sent the reporter hunting a file that was never missing.
+ *
+ * Knowing the file exists, is a regular file, and is writable already excludes
+ * most of the space — it says the refusal is structural, not a permission or
+ * missing-file problem. */
+static void describe_agent_config_target(const char *path, char *out, size_t out_size) {
+    if (!out || out_size == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!path || !path[0]) {
+        return;
+    }
+    cbm_path_info_t info;
+    if (cbm_path_info_utf8(path, &info) != 0) {
+        (void)snprintf(out, out_size, " (target: does not exist or cannot be inspected)");
+        return;
+    }
+    const char *kind = info.is_symlink     ? "symlink"
+                       : info.is_directory ? "directory"
+                       : info.is_regular   ? "regular file"
+                                           : "special file";
+    (void)snprintf(out, out_size, " (target: %s, %lld bytes)", kind, (long long)info.size);
+}
+
+static void record_agent_config_error_with_reason(bool uninstalling, const char *agent,
+                                                  const char *operation, const char *path,
+                                                  const char *reason) {
     int *counter = uninstalling ? &g_agent_uninstall_errors : &g_agent_install_errors;
     (*counter)++;
-    (void)fprintf(stderr, "error: agent_config agent=%s op=%s path=%s\n", agent ? agent : "unknown",
+    char detail[160];
+    describe_agent_config_target(path, detail, sizeof(detail));
+    (void)fprintf(stderr, "error: agent_config agent=%s op=%s path=%s", agent ? agent : "unknown",
                   operation ? operation : "unknown", path ? path : "unknown");
+    if (reason && reason[0]) {
+        (void)fprintf(stderr, " reason=%s", reason);
+    }
+    (void)fputs(detail, stderr);
+    (void)fputc('\n', stderr);
+}
+
+static void record_agent_config_error(bool uninstalling, const char *agent, const char *operation,
+                                      const char *path) {
+    record_agent_config_error_with_reason(uninstalling, agent, operation, path, NULL);
 }
 
 static bool prepare_config_parent(const char *path) {
@@ -7648,13 +7649,29 @@ static void install_claude_code_config(const char *home, const char *binary_path
     bool gate_ok = dry_run;
     bool session_ok = dry_run;
     bool subagent_ok = dry_run;
+    if (dry_run) {
+        /* #1387 (second half): the dry run claimed EVERY hook group as
+         * installable because these flags were simply `true`. When the on-disk
+         * script is not ours the real install refuses to rewrite it, so the
+         * preview promised what the run could not deliver and the reporter had
+         * no way to see the loss coming. Predict each refusal read-only. */
+        gate_ok = cbm_hook_script_write_would_succeed(home, binary_path, CMM_HOOK_GATE_SCRIPT);
+        session_ok =
+            cbm_hook_script_write_would_succeed(home, binary_path, CMM_SESSION_REMINDER_SCRIPT);
+        subagent_ok =
+            cbm_hook_script_write_would_succeed(home, binary_path, CMM_SUBAGENT_REMINDER_SCRIPT);
+    }
     if (!dry_run) {
         char hook_path[CLI_BUF_1K];
         gate_ok = cbm_install_hook_gate_script(home, binary_path);
         snprintf(hook_path, sizeof(hook_path), "%s/hooks/%s", config_dir, CMM_HOOK_GATE_SCRIPT);
+        /* #1387: a failed script (re)write must never remove existing hook
+         * entries. The common failure is TEXT_UNOWNED - a script the user
+         * modified or a manual install wrote with another binary path - and
+         * that script still works; deleting the registration turns a skipped
+         * update into config loss. Entry removal belongs to uninstall only. */
         if (!gate_ok) {
             record_agent_config_error(false, "Claude Code", "hook_script_install", hook_path);
-            (void)cbm_remove_claude_hooks(settings_path);
         } else if (cbm_upsert_claude_hooks(settings_path) != CLI_OK) {
             gate_ok = false;
             record_agent_config_error(false, "Claude Code", "hook_register", settings_path);
@@ -7665,7 +7682,6 @@ static void install_claude_code_config(const char *home, const char *binary_path
                  CMM_SESSION_REMINDER_SCRIPT);
         if (!session_ok) {
             record_agent_config_error(false, "Claude Code", "hook_script_install", hook_path);
-            (void)cbm_remove_session_hooks(settings_path);
         } else if (cbm_upsert_session_hooks(settings_path) != CLI_OK) {
             session_ok = false;
             record_agent_config_error(false, "Claude Code", "hook_register", settings_path);
@@ -7676,7 +7692,6 @@ static void install_claude_code_config(const char *home, const char *binary_path
                  CMM_SUBAGENT_REMINDER_SCRIPT);
         if (!subagent_ok) {
             record_agent_config_error(false, "Claude Code", "hook_script_install", hook_path);
-            (void)cbm_remove_claude_subagent_hooks(settings_path);
         } else if (cbm_upsert_claude_subagent_hooks(settings_path) != CLI_OK) {
             subagent_ok = false;
             record_agent_config_error(false, "Claude Code", "hook_register", settings_path);
@@ -7691,6 +7706,22 @@ static void install_claude_code_config(const char *home, const char *binary_path
     }
     if (subagent_ok) {
         printf("  hooks: SubagentStart (MCP usage reminder for subagents)\n");
+    }
+    if (dry_run) {
+        /* Name every script the real run would refuse. Silence is what made
+         * #1387 invisible in advance: the group simply went unmentioned, which
+         * reads as "nothing to do" rather than "this will be skipped". */
+        static const char *const preview_scripts[] = {
+            CMM_HOOK_GATE_SCRIPT, CMM_SESSION_REMINDER_SCRIPT, CMM_SUBAGENT_REMINDER_SCRIPT};
+        const bool preview_ok[] = {gate_ok, session_ok, subagent_ok};
+        for (size_t i = 0U; i < sizeof(preview_scripts) / sizeof(preview_scripts[0]); i++) {
+            if (!preview_ok[i]) {
+                printf("  hooks: %s/hooks/%s would be skipped — the file there is not ours "
+                       "(modified, or written by another install), so the rewrite is refused "
+                       "and existing hook entries are left untouched\n",
+                       config_dir, preview_scripts[i]);
+            }
+        }
     }
 
     /* Migration nudge: when CLAUDE_CONFIG_DIR is set and a legacy ~/.claude tree
@@ -7869,10 +7900,17 @@ static void install_tiered_agent_profiles(cbm_tiered_profile_set_t profiles, boo
             access == CBM_GRAPH_ACCESS_DIRECT ? CBM_GRAPH_ACCESS_HANDOFF : CBM_GRAPH_ACCESS_DIRECT;
         char *alternate = cbm_render_graph_profile(profiles.dialect, tier, alternate_access,
                                                    profiles.binary_path);
-        const char *released[2];
+        char *codex_rc1 =
+            profiles.dialect == CBM_GRAPH_DIALECT_CODEX && access == CBM_GRAPH_ACCESS_DIRECT
+                ? cbm_render_graph_profile_codex_rc1(tier)
+                : NULL;
+        const char *released[3];
         size_t released_count = 0U;
         if (alternate) {
             released[released_count++] = alternate;
+        }
+        if (codex_rc1) {
+            released[released_count++] = codex_rc1;
         }
         if (tier == CBM_GRAPH_TIER_VERIFY && profiles.legacy_verify_content) {
             released[released_count++] = profiles.legacy_verify_content;
@@ -7880,6 +7918,7 @@ static void install_tiered_agent_profiles(cbm_tiered_profile_set_t profiles, boo
         int result = prepare_config_parent(path)
                          ? cbm_text_migrate_owned_document(path, current, released, released_count)
                          : CLI_ERR;
+        free(codex_rc1);
         free(alternate);
         free(current);
         if (result != CLI_OK) {
@@ -7916,15 +7955,23 @@ static void uninstall_tiered_agent_profiles(cbm_tiered_profile_set_t profiles, b
             access == CBM_GRAPH_ACCESS_DIRECT ? CBM_GRAPH_ACCESS_HANDOFF : CBM_GRAPH_ACCESS_DIRECT;
         char *alternate = cbm_render_graph_profile(profiles.dialect, tier, alternate_access,
                                                    profiles.binary_path);
-        const char *released[2];
+        char *codex_rc1 =
+            profiles.dialect == CBM_GRAPH_DIALECT_CODEX && access == CBM_GRAPH_ACCESS_DIRECT
+                ? cbm_render_graph_profile_codex_rc1(tier)
+                : NULL;
+        const char *released[3];
         size_t released_count = 0U;
         if (alternate) {
             released[released_count++] = alternate;
+        }
+        if (codex_rc1) {
+            released[released_count++] = codex_rc1;
         }
         if (tier == CBM_GRAPH_TIER_VERIFY && profiles.legacy_verify_content) {
             released[released_count++] = profiles.legacy_verify_content;
         }
         int result = cbm_text_remove_owned_document_any(path, current, released, released_count);
+        free(codex_rc1);
         free(alternate);
         free(current);
         if (result < CLI_OK) {
@@ -8135,15 +8182,7 @@ static void print_detected_registry_agents(const char *home, bool *any) {
 static void cbm_agent_installed_binary_path(const char *home, char *binary_path,
                                             size_t binary_path_size) {
 #ifdef _WIN32
-    char *managed = g_windows_launcher_context.present && g_windows_launcher_context.managed
-                        ? cli_windows_plain_utf8(g_windows_launcher_context.canonical_launcher_path)
-                        : NULL;
-    if (managed) {
-        (void)snprintf(binary_path, binary_path_size, "%s", managed);
-        free(managed);
-    } else {
-        snprintf(binary_path, binary_path_size, "%s/.local/bin/codebase-memory-mcp.exe", home);
-    }
+    snprintf(binary_path, binary_path_size, "%s/.local/bin/codebase-memory-mcp.exe", home);
 #else
     snprintf(binary_path, binary_path_size, "%s/.local/bin/codebase-memory-mcp", home);
 #endif
@@ -8310,13 +8349,69 @@ static void install_devin_durable_context(const cbm_agent_registry_context_t *re
     }
 }
 
-static void install_pi_durable_context(const char *home, bool force, bool dry_run) {
+/* Write a generated client extension module into `path` as a managed block.
+ *
+ * The module is generated from the tool registry rather than shipped (see
+ * src/cli/client_adapter.h), and it goes in as a MARKED BLOCK rather than a
+ * whole-file write: the directory is auto-loaded by the client, so a user may
+ * legitimately keep their own module there, and clobbering it would be the
+ * install routine destroying user content.
+ *
+ * `generate` returns heap-allocated text or NULL; NULL is a hard error rather
+ * than a skip, because a silently absent extension is exactly the failure mode
+ * that left #616 a no-op for six weeks. */
+static void install_generated_client_extension(const char *label, const char *path,
+                                               const char *binary_path,
+                                               char *(*generate)(const char *), bool dry_run) {
+    if (g_install_plan) {
+        plan_record(label, "extension", path);
+        return;
+    }
+    char *content = generate(binary_path);
+    if (!content) {
+        record_agent_config_error(false, label, "extension_generate", path);
+        return;
+    }
+    bool installed = true;
+    if (!dry_run && (!prepare_config_parent(path) ||
+                     cbm_text_upsert_managed_block(path, CBM_ADAPTER_MARKER_START,
+                                                   CBM_ADAPTER_MARKER_END, content) != 0)) {
+        installed = false;
+        record_agent_config_error(false, label, "extension_install", path);
+    }
+    free(content);
+    if (installed) {
+        printf("  extension: %s\n", path);
+    }
+}
+
+/* Remove only OUR marked block, never the file: a user's own module may share
+ * it, and owned removal is the convention every other uninstall path here
+ * follows. */
+static void uninstall_generated_client_extension(const char *label, const char *path,
+                                                 bool dry_run) {
+    if (!dry_run && cbm_file_exists(path) &&
+        cbm_text_remove_managed_block(path, CBM_ADAPTER_MARKER_START, CBM_ADAPTER_MARKER_END) !=
+            0) {
+        record_agent_config_error(true, label, "extension_uninstall", path);
+        return;
+    }
+    printf("  extension: removed managed block\n");
+}
+
+static void install_pi_durable_context(const char *home, const char *binary_path, bool force,
+                                       bool dry_run) {
     char instructions_path[CLI_BUF_1K];
     char skills_dir[CLI_BUF_1K];
+    char extension_path[CLI_BUF_1K];
     snprintf(instructions_path, sizeof(instructions_path), "%s/.pi/agent/AGENTS.md", home);
     snprintf(skills_dir, sizeof(skills_dir), "%s/.pi/agent/skills", home);
+    snprintf(extension_path, sizeof(extension_path), "%s/.pi/agent/extensions/cbmem.ts", home);
     install_managed_agent_instructions("Pi", instructions_path, dry_run);
     install_agent_skill("Pi", skills_dir, force, dry_run);
+    /* pi has no MCP client, so this bridge is its ONLY route to the graph. */
+    install_generated_client_extension("Pi", extension_path, binary_path, cbm_client_adapter_pi,
+                                       dry_run);
 }
 
 static void install_kimi_durable_context(const cbm_agent_registry_context_t *registry,
@@ -8494,7 +8589,7 @@ static void install_agent_client_registry(const char *home, const char *binary_p
         } else if (profile->id == CBM_AGENT_CLIENT_POCHI) {
             install_pochi_durable_context(home, force, dry_run);
         } else if (profile->id == CBM_AGENT_CLIENT_PI) {
-            install_pi_durable_context(home, force, dry_run);
+            install_pi_durable_context(home, binary_path, force, dry_run);
         }
     }
 }
@@ -8557,6 +8652,35 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
         snprintf(ip, sizeof(ip), "%s/AGENTS.md", config_dir);
         snprintf(skills_dir, sizeof(skills_dir), "%s/skills", config_dir);
         snprintf(ap, sizeof(ap), "%s/agents/codebase-memory.toml", config_dir);
+        char command[CLI_BUF_8K];
+        char command_windows[CLI_BUF_8K];
+        char hooks_json[CLI_BUF_1K];
+        snprintf(hooks_json, sizeof(hooks_json), "%s/hooks.json", config_dir);
+        bool use_hooks_json = cbm_file_exists(hooks_json);
+        bool commands_ok =
+            cbm_build_augment_command(binary_path, command, sizeof(command)) == CLI_OK &&
+            cbm_build_augment_command_windows(binary_path, command_windows,
+                                              sizeof(command_windows)) == CLI_OK;
+        cbm_toml_codex_hook_action_t preflight_action =
+            use_hooks_json ? CBM_TOML_CODEX_HOOK_REMOVE : CBM_TOML_CODEX_HOOK_UPSERT;
+        cbm_toml_codex_hook_failure_t preflight_failure = CBM_TOML_CODEX_HOOK_FAILURE_NONE;
+        int preflight_result = commands_ok ? cbm_reconcile_codex_hooks_command_detailed(
+                                                 cp, command, command_windows, preflight_action,
+                                                 true, &preflight_failure)
+                                           : CLI_ERR;
+        if (preflight_result != CLI_OK) {
+            if (!g_install_plan) {
+                printf("Codex CLI:\n");
+                fflush(stdout);
+            }
+            const char *reason = preflight_failure == CBM_TOML_CODEX_HOOK_FAILURE_NONE
+                                     ? NULL
+                                     : cbm_toml_codex_hook_failure_name(preflight_failure);
+            record_agent_config_error_with_reason(
+                false, "Codex CLI", commands_ok ? "hook_preflight" : "hook_command_build", cp,
+                reason);
+            goto codex_install_done;
+        }
         install_generic_agent_config("Codex CLI", binary_path, cp, ip, dry_run,
                                      cbm_upsert_codex_mcp);
         install_agent_skill("Codex CLI", skills_dir, force, dry_run);
@@ -8574,53 +8698,29 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
          * SessionStart reminder there instead of config.toml. Writing both
          * makes Codex warn about loading hooks from two representations (#570).
          * config.toml remains the mcp_config target above either way. */
-        char hooks_json[CLI_BUF_1K];
-        snprintf(hooks_json, sizeof(hooks_json), "%s/hooks.json", config_dir);
-        bool use_hooks_json = cbm_file_exists(hooks_json);
         const char *hook_target = use_hooks_json ? hooks_json : cp;
         if (g_install_plan) {
             plan_record("Codex CLI", "hook", hook_target);
         } else {
             bool hook_ok = true;
-            if (!dry_run) {
-                char command[CLI_BUF_8K];
-                char command_windows[CLI_BUF_8K];
-                if (cbm_build_augment_command(binary_path, command, sizeof(command)) == CLI_OK &&
-                    cbm_build_augment_command_windows(binary_path, command_windows,
-                                                      sizeof(command_windows)) == CLI_OK) {
-                    if (use_hooks_json) {
-                        if (cbm_upsert_paired_lifecycle_hooks_json(
-                                hooks_json, command, command_windows, NULL, CMM_HOOK_TIMEOUT_SEC) ==
-                            CLI_OK) {
-                            if (cbm_remove_codex_hooks(cp) != CLI_OK) {
-                                hook_ok = false;
-                                record_agent_config_error(false, "Codex CLI", "legacy_hook_cleanup",
-                                                          cp);
-                            }
-                        } else {
-                            hook_ok = false;
-                            record_agent_config_error(false, "Codex CLI", "hook_install",
-                                                      hooks_json);
-                        }
-                    } else {
-                        if (cbm_upsert_codex_hooks_command(cp, command, command_windows) !=
-                            CLI_OK) {
-                            hook_ok = false;
-                            record_agent_config_error(false, "Codex CLI", "hook_install", cp);
-                        }
-                    }
-                } else {
-                    hook_ok = false;
-                    record_agent_config_error(false, "Codex CLI", "hook_command_build",
-                                              hook_target);
-                }
+            if (!dry_run && use_hooks_json) {
+                hook_ok =
+                    cbm_upsert_paired_lifecycle_hooks_json(hooks_json, command, command_windows,
+                                                           NULL, CMM_HOOK_TIMEOUT_SEC) == CLI_OK &&
+                    cbm_reconcile_codex_hooks_command(cp, command, command_windows,
+                                                      CBM_TOML_CODEX_HOOK_REMOVE, false) == CLI_OK;
+            } else if (!dry_run) {
+                hook_ok = cbm_upsert_codex_hooks_command(cp, command, command_windows) == CLI_OK;
             }
-            if (hook_ok) {
+            if (!hook_ok) {
+                record_agent_config_error(false, "Codex CLI", "hook_install", hook_target);
+            } else {
                 printf("  hooks: SessionStart + SubagentStart (dynamic graph context)\n");
+                printf("  note: non-managed hooks require /hooks trust; definition changes "
+                       "require re-trust\n");
             }
-            printf("  note: non-managed hooks require /hooks trust; definition changes require "
-                   "re-trust\n");
         }
+    codex_install_done:;
     }
     if (agents->gemini) {
         install_gemini_config(home, binary_path, dry_run);
@@ -8646,6 +8746,16 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
                 .dialect = CBM_GRAPH_DIALECT_OPENCODE,
             },
             dry_run);
+        /* OpenCode already reaches every tool over MCP (installed just above),
+         * so this adds no tools -- only the automatic graph lookup before a
+         * grep/glob that other clients get from their own hook configuration.
+         * OpenCode has no such configuration; a plugin module is its only
+         * extension point (verified against their plugin documentation). */
+        char plugin_path[CLI_BUF_1K];
+        snprintf(plugin_path, sizeof(plugin_path), "%s/.config/opencode/plugins/cbm-augment.ts",
+                 home);
+        install_generated_client_extension("OpenCode", plugin_path, binary_path,
+                                           cbm_client_adapter_opencode, dry_run);
     }
     if (agents->antigravity) {
         char cp[CLI_BUF_1K];
@@ -9258,10 +9368,19 @@ static void install_additional_agent_configs(const cbm_detected_agents_t *agents
     }
 }
 
+/* #1558: set by `install --clients=...` after validation, consumed at the one
+ * place detection happens. Validation runs in cbm_cmd_install so an unknown
+ * token fails before anything is written, not midway through configuring. */
+static const char *g_client_selection = NULL;
+static bool cli_clients_apply_selection(const char *spec, cbm_detected_agents_t *detected);
+static void cli_clients_print_list(FILE *out);
+
 int cbm_install_agent_configs(const char *home, const char *binary_path, bool force, bool dry_run) {
     g_agent_install_errors = 0;
-    g_mcp_upsert_force = force;
     cbm_detected_agents_t agents = cbm_detect_agents(home);
+    if (g_client_selection && !cli_clients_apply_selection(g_client_selection, &agents)) {
+        return CLI_ERR;
+    }
     if (!g_install_plan) {
         print_detected_agents(&agents, home);
     }
@@ -9276,6 +9395,16 @@ int cbm_install_agent_configs(const char *home, const char *binary_path, bool fo
         agents.claude_code && !dry_run && cbm_has_complete_claude_session_hooks(home);
     install_agent_client_registry(home, binary_path, inherit_claude_session, force, dry_run);
     return g_agent_install_errors == 0 ? CLI_OK : CLI_ERR;
+}
+
+static int cbm_install_agent_configs_with_previous(const char *home, const char *binary_path,
+                                                   const char *previous_managed_binary_path,
+                                                   bool force, bool dry_run) {
+    const char *saved = g_previous_managed_mcp_command;
+    g_previous_managed_mcp_command = previous_managed_binary_path;
+    int result = cbm_install_agent_configs(home, binary_path, force, dry_run);
+    g_previous_managed_mcp_command = saved;
+    return result;
 }
 
 /* Count .db files in the cache directory. */
@@ -9367,29 +9496,165 @@ int cbm_install_handle_existing_indexes(const char *home, bool reset, bool dry_r
     return prepare_result;
 }
 
+/* ── Client selection (#1558) ──────────────────────────────────
+ *
+ * `install` configured EVERY detected client. A user who wanted Claude and
+ * Codex had to revert the OpenCode and Cursor integrations by hand, and the
+ * next install silently recreated them. `--clients=claude,codex` restricts it.
+ *
+ * The table is the flag's vocabulary AND its documentation: 26 clients ship
+ * here, with tokens nobody would guess (factory-droid, mistral-vibe,
+ * copilot-cli), so `--clients=help` prints every token. A selector whose
+ * accepted values can only be learned from the source is not a usable
+ * selector, and an unrecognised token fails loudly with the list rather than
+ * silently configuring nothing. */
+typedef struct {
+    const char *token;
+    size_t offset;
+    const char *display;
+} cli_client_def_t;
+
+#define CLI_CLIENT(field, token, display) \
+    { token, offsetof(cbm_detected_agents_t, field), display }
+
+static const cli_client_def_t CLI_CLIENTS[] = {
+    CLI_CLIENT(claude_code, "claude", "Claude Code"),
+    CLI_CLIENT(codex, "codex", "Codex"),
+    CLI_CLIENT(gemini, "gemini", "Gemini"),
+    CLI_CLIENT(zed, "zed", "Zed"),
+    CLI_CLIENT(opencode, "opencode", "OpenCode"),
+    CLI_CLIENT(antigravity, "antigravity", "Antigravity"),
+    CLI_CLIENT(aider, "aider", "Aider"),
+    CLI_CLIENT(kilocode, "kilocode", "Kilo Code"),
+    CLI_CLIENT(vscode, "vscode", "VS Code"),
+    CLI_CLIENT(cursor, "cursor", "Cursor"),
+    CLI_CLIENT(windsurf, "windsurf", "Windsurf"),
+    CLI_CLIENT(augment, "augment", "Augment"),
+    CLI_CLIENT(openclaw, "openclaw", "OpenClaw"),
+    CLI_CLIENT(kiro, "kiro", "Kiro"),
+    CLI_CLIENT(junie, "junie", "Junie"),
+    CLI_CLIENT(hermes, "hermes", "Hermes"),
+    CLI_CLIENT(openhands, "openhands", "OpenHands"),
+    CLI_CLIENT(cline, "cline", "Cline"),
+    CLI_CLIENT(warp, "warp", "Warp"),
+    CLI_CLIENT(qwen, "qwen", "Qwen"),
+    CLI_CLIENT(copilot_cli, "copilot-cli", "Copilot CLI"),
+    CLI_CLIENT(factory_droid, "factory-droid", "Factory Droid"),
+    CLI_CLIENT(crush, "crush", "Crush"),
+    CLI_CLIENT(goose, "goose", "Goose"),
+    CLI_CLIENT(mistral_vibe, "mistral-vibe", "Mistral Vibe"),
+};
+
+enum { CLI_CLIENT_COUNT = sizeof(CLI_CLIENTS) / sizeof(CLI_CLIENTS[0]) };
+
+static void cli_clients_print_list(FILE *out) {
+    (void)fprintf(out, "Available --clients tokens:\n");
+    for (size_t i = 0; i < CLI_CLIENT_COUNT; i++) {
+        (void)fprintf(out, "  %-16s %s\n", CLI_CLIENTS[i].token, CLI_CLIENTS[i].display);
+    }
+    (void)fprintf(out, "\nExample: --clients=claude,codex\n"
+                       "Omit --clients to configure every detected client.\n");
+}
+
+/* Restrict `detected` to the comma-separated token list. Returns false (after
+ * printing the vocabulary) when a token is unknown, so a typo can never be
+ * mistaken for "that client was not installed". */
+static bool cli_clients_apply_selection(const char *spec, cbm_detected_agents_t *detected) {
+    bool wanted[CLI_CLIENT_COUNT];
+    memset(wanted, 0, sizeof(wanted));
+    char buf[CLI_BUF_1K];
+    snprintf(buf, sizeof(buf), "%s", spec ? spec : "");
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        while (*tok == ' ') {
+            tok++;
+        }
+        size_t len = strlen(tok);
+        while (len > 0 && tok[len - 1] == ' ') {
+            tok[--len] = '\0';
+        }
+        if (!tok[0]) {
+            continue;
+        }
+        bool matched = false;
+        for (size_t i = 0; i < CLI_CLIENT_COUNT; i++) {
+            if (strcmp(tok, CLI_CLIENTS[i].token) == 0) {
+                wanted[i] = true;
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            (void)fprintf(stderr, "error: unknown client: %s\n\n", tok);
+            cli_clients_print_list(stderr);
+            return false;
+        }
+    }
+    for (size_t i = 0; i < CLI_CLIENT_COUNT; i++) {
+        if (!wanted[i]) {
+            *(bool *)((char *)detected + CLI_CLIENTS[i].offset) = false;
+        }
+    }
+    return true;
+}
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+bool cbm_cli_clients_apply_selection_for_testing(const char *spec,
+                                                 cbm_detected_agents_t *detected) {
+    return cli_clients_apply_selection(spec, detected);
+}
+size_t cbm_cli_clients_count_for_testing(void) {
+    return CLI_CLIENT_COUNT;
+}
+const char *cbm_cli_clients_token_for_testing(size_t index) {
+    return index < CLI_CLIENT_COUNT ? CLI_CLIENTS[index].token : NULL;
+}
+#endif
+
 /* ── Subcommand: install ──────────────────────────────────────── */
 
-/* The portable activation flow (self-path detection, simple-copy activate)
- * serves every POSIX build, and Windows TEST builds only: there the C suite
- * reaches it through the activation test seam to unit-cover the shared
- * activation/agent-config semantics, while release Windows binaries compile
- * exclusively the managed launcher transaction. */
-#if !defined(_WIN32) || defined(CBM_CLI_ENABLE_TEST_API)
-/* Detect the running binary's path at runtime. Falls back to ~/.local/bin/. */
-static void cbm_detect_self_path(char *buf, size_t buf_sz, const char *home) {
+/* The activation flow (self-path detection, simple-copy activate) is the same
+ * on every platform: Windows ships ONE binary, exactly like Linux and macOS. */
+/* Detect the running binary's path at runtime. The return value distinguishes
+ * OS-reported identity (safe ownership evidence) from the ~/.local/bin fallback
+ * used only as an install copy source. */
+static bool cbm_detect_self_path(char *buf, size_t buf_sz, const char *home) {
     buf[0] = '\0';
+    bool exact = false;
 #ifdef _WIN32
-    GetModuleFileNameA(NULL, buf, (DWORD)buf_sz);
-    cbm_normalize_path_sep(buf);
+    /* GetModuleFileNameA renders the module path through the ANSI code page,
+     * which mangles non-ASCII install paths (café_日本語 -> caf?_???). Resolve
+     * wide and convert to UTF-8 so the returned path survives verbatim. */
+    char *module_path = cbm_module_path_utf8();
+    size_t length = module_path ? strlen(module_path) : 0U;
+    exact = module_path && length > 0U && length < buf_sz;
+    if (exact) {
+        memcpy(buf, module_path, length + 1U);
+        cbm_normalize_path_sep(buf);
+    } else {
+        buf[0] = '\0';
+    }
+    free(module_path);
 #elif defined(__APPLE__)
     uint32_t sp_sz = (uint32_t)buf_sz;
-    if (_NSGetExecutablePath(buf, &sp_sz) != 0) {
+    exact = _NSGetExecutablePath(buf, &sp_sz) == 0;
+    if (!exact) {
+        buf[0] = '\0';
+    }
+#elif defined(__FreeBSD__)
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
+    size_t cb = buf_sz;
+    exact = sysctl(mib, 4, buf, &cb, NULL, 0) == 0 && cb > 0;
+    if (!exact) {
         buf[0] = '\0';
     }
 #else
     ssize_t sp_len = readlink("/proc/self/exe", buf, buf_sz - SKIP_ONE);
-    if (sp_len > 0) {
+    exact = sp_len > 0 && (size_t)sp_len < buf_sz - SKIP_ONE;
+    if (exact) {
         buf[sp_len] = '\0';
+    } else {
+        buf[0] = '\0';
     }
 #endif
     if (!buf[0]) {
@@ -9399,8 +9664,73 @@ static void cbm_detect_self_path(char *buf, size_t buf_sz, const char *home) {
         snprintf(buf, buf_sz, "%s/.local/bin/codebase-memory-mcp", home);
 #endif
     }
+    return exact;
 }
-#endif /* !defined(_WIN32) || defined(CBM_CLI_ENABLE_TEST_API) */
+
+/* Is the running binary owned by an external package manager rather than by us?
+ *
+ * #1566: cbm's installer does two separable jobs — place the binary (and put its
+ * directory on PATH), and configure the agents. For someone who installed
+ * through mise, Homebrew or nix, the first job is not merely redundant: it drops
+ * a SECOND copy into ~/.local/bin that shadows the managed one depending on PATH
+ * order, and appends to a shell rc file the package manager never asked us to
+ * touch. They wanted the agent configs refreshed and nothing else.
+ *
+ * The signal is simply that the OS says we are running from somewhere other than
+ * the directory we install into. We only infer when the OS REPORTED the path
+ * (exact): the ~/.local/bin fallback is a guess, and guessing here would refuse
+ * to install for someone who has no binary at all. Naming the manager is
+ * best-effort — the behaviour does not depend on recognising it, only the
+ * wording does. */
+static const char *cli_external_manager_name(const char *self_path) {
+    if (!self_path || !self_path[0]) {
+        return NULL;
+    }
+    if (strstr(self_path, "/mise/") || strstr(self_path, "/.mise/")) {
+        return "mise";
+    }
+    if (strstr(self_path, "/Cellar/") || strstr(self_path, "/homebrew/") ||
+        strstr(self_path, "/linuxbrew/")) {
+        return "Homebrew";
+    }
+    if (strstr(self_path, "/nix/store/")) {
+        return "nix";
+    }
+    if (strstr(self_path, "/.asdf/")) {
+        return "asdf";
+    }
+    if (strstr(self_path, "/.cargo/bin/")) {
+        return "cargo";
+    }
+    return NULL;
+}
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+const char *cbm_cli_external_manager_name_for_testing(const char *self_path) {
+    return cli_external_manager_name(self_path);
+}
+#endif
+
+static bool cli_binary_is_externally_managed(const char *self_path, bool self_path_exact,
+                                             const char *bin_dir) {
+    (void)bin_dir;
+    if (!self_path_exact || !self_path || !self_path[0]) {
+        return false;
+    }
+    /* POSITIVE evidence only: the path must look like a known package manager's.
+     *
+     * The tempting rule — "anything outside the directory we install into" —
+     * is wrong, and the test suite proved it immediately: a test binary runs
+     * from build/, and a perfectly ordinary `install --dir=/opt/cbm` also lives
+     * outside the default. Both would be misread as foreign, and `update` would
+     * refuse to update an installation we own.
+     *
+     * The asymmetry decides it. A false positive REFUSES a legitimate update; a
+     * false negative just leaves today's behaviour in place for an unrecognised
+     * manager, which --skip-binary covers explicitly. So we only infer when we
+     * can name the owner. */
+    return cli_external_manager_name(self_path) != NULL;
+}
 
 /* Build the agent.install.plan.v1 receipt (#388): a machine-readable list of
  * the config / instruction / skill / agent / hook files `install` WOULD write, produced by
@@ -9522,7 +9852,6 @@ char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
     return cbm_build_install_plan_json_options(home, binary_path, false);
 }
 
-#if !defined(_WIN32) || defined(CBM_CLI_ENABLE_TEST_API)
 typedef struct {
     const char *bin_target;
     const char *bin_dir;
@@ -9533,6 +9862,10 @@ typedef struct {
     cli_binary_validator_t binary_validator;
     bool has_binary_validator;
     bool copy_binary;
+    /* #1566: true when the binary is not ours to place — suppresses the PATH
+     * edit too, since adding a directory to PATH for a binary we did not
+     * install is exactly the unasked-for change that was complained about. */
+    bool skip_binary;
     bool delete_indexes;
     bool skip_config;
     bool force;
@@ -9545,6 +9878,9 @@ static int cli_install_activate(void *opaque) {
         !activation->shell_rc) {
         return CLI_TRUE;
     }
+    char previous_managed_binary[CLI_BUF_1K] = {0};
+    bool previous_managed_binary_exact = cbm_detect_self_path(
+        previous_managed_binary, sizeof(previous_managed_binary), activation->home);
     if (activation->copy_binary) {
         if (activation->dry_run) {
             printf("Would install binary -> %s\n\n", activation->bin_target);
@@ -9590,8 +9926,10 @@ static int cli_install_activate(void *opaque) {
      * including same-binary and non-force installs. */
     int agent_config_rc = CLI_OK;
     if (!activation->skip_config) {
-        agent_config_rc = cbm_install_agent_configs(activation->home, activation->bin_target,
-                                                    activation->force, activation->dry_run);
+        agent_config_rc = cbm_install_agent_configs_with_previous(
+            activation->home, activation->bin_target,
+            previous_managed_binary_exact ? previous_managed_binary : NULL, activation->force,
+            activation->dry_run);
     }
     if (agent_config_rc != CLI_OK) {
         cli_activation_transaction_finalize_committed_or_fail_stop(
@@ -9602,6 +9940,14 @@ static int cli_install_activate(void *opaque) {
         return CLI_ACTIVATION_PARTIAL;
     }
     int path_rc = CLI_TRUE;
+    /* #1566: only touch PATH when WE placed the binary. Appending to a shell rc
+     * for a binary installed by someone else is an unasked-for change to a file
+     * we do not own, and the directory we would add may hold nothing at all. */
+    if (activation->skip_binary) {
+        cli_activation_transaction_finalize_committed_or_fail_stop(&activation->binary_transaction,
+                                                                   "install_transaction_finalize");
+        return CLI_OK;
+    }
 #ifdef _WIN32
     path_rc = cli_ensure_windows_user_path(activation->bin_dir,
                                            activation->dry_run || g_cli_activation_test_ops_set);
@@ -9643,816 +9989,6 @@ static int cli_install_activate(void *opaque) {
                                                                "install_transaction_finalize");
     return CLI_OK;
 }
-#endif /* !defined(_WIN32) || defined(CBM_CLI_ENABLE_TEST_API) */
-
-#ifdef _WIN32
-typedef struct {
-    const char *home;
-    const char *bin_dir;
-    const char *bin_target;
-    wchar_t canonical_launcher[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    wchar_t launcher_source[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    wchar_t payload_source[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    wchar_t previous_launcher_backing[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    cbm_windows_current_v1_t state;
-    cbm_windows_current_v1_t previous_state;
-    cbm_windows_transition_plan_t transition_plan;
-    bool initial_install;
-    bool previous_state_valid;
-    bool previous_launcher_backing_valid;
-    bool delete_indexes;
-    bool skip_config;
-    bool force;
-    bool dry_run;
-} cli_windows_install_activation_t;
-
-static bool cli_windows_current_path(const wchar_t *canonical_launcher,
-                                     wchar_t out[CBM_WINDOWS_LAUNCHER_PATH_CAP]) {
-    wchar_t directory[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    wchar_t state_directory[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    return cli_windows_parent_path(canonical_launcher, directory, CBM_WINDOWS_LAUNCHER_PATH_CAP) &&
-           cli_windows_join_path(directory, L".cbm", state_directory,
-                                 CBM_WINDOWS_LAUNCHER_PATH_CAP) &&
-           cli_windows_join_path(state_directory, L"current-v1", out,
-                                 CBM_WINDOWS_LAUNCHER_PATH_CAP);
-}
-
-static bool cli_windows_read_current(const wchar_t *canonical_launcher,
-                                     cbm_windows_current_v1_t *state_out, bool *exists_out) {
-    if (!state_out || !exists_out) {
-        return false;
-    }
-    memset(state_out, 0, sizeof(*state_out));
-    *exists_out = false;
-    wchar_t path[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    if (!cli_windows_current_path(canonical_launcher, path)) {
-        return false;
-    }
-    HANDLE file =
-        CreateFileW(path, GENERIC_READ | READ_CONTROL, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL,
-                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
-    if (file == INVALID_HANDLE_VALUE) {
-        DWORD error = GetLastError();
-        return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
-    }
-    BY_HANDLE_FILE_INFORMATION information;
-    LARGE_INTEGER size;
-    uint8_t record[CBM_WINDOWS_CURRENT_V1_SIZE];
-    DWORD received = 0;
-    bool valid = GetFileInformationByHandle(file, &information) != 0 &&
-                 (information.dwFileAttributes &
-                  (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0 &&
-                 information.nNumberOfLinks == 1 && GetFileSizeEx(file, &size) != 0 &&
-                 size.QuadPart == CBM_WINDOWS_CURRENT_V1_SIZE &&
-                 ReadFile(file, record, sizeof(record), &received, NULL) != 0 &&
-                 received == sizeof(record) &&
-                 cbm_windows_current_v1_decode(record, sizeof(record), state_out);
-    (void)CloseHandle(file);
-    *exists_out = true;
-    return valid;
-}
-
-static bool cli_windows_current_equal(const cbm_windows_current_v1_t *left,
-                                      const cbm_windows_current_v1_t *right) {
-    return left && right && left->launcher_abi_min == right->launcher_abi_min &&
-           left->launcher_abi_max == right->launcher_abi_max &&
-           left->payload_size == right->payload_size &&
-           strcmp(left->payload_sha256, right->payload_sha256) == 0;
-}
-
-static bool cli_windows_remove_current_if_present(const wchar_t *canonical_launcher) {
-    cbm_windows_current_v1_t observed;
-    bool exists = false;
-    wchar_t current[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    if (!cli_windows_read_current(canonical_launcher, &observed, &exists) ||
-        !cli_windows_current_path(canonical_launcher, current)) {
-        return false;
-    }
-    if (!exists) {
-        return true;
-    }
-    return DeleteFileW(current) != 0;
-}
-
-static bool cli_windows_restore_managed_pair(const wchar_t *canonical_launcher,
-                                             const wchar_t *previous_launcher_backing,
-                                             bool previous_launcher_backing_valid,
-                                             const cbm_windows_current_v1_t *previous_state,
-                                             bool previous_state_valid, char *error,
-                                             size_t error_size) {
-    if (error && error_size > 0U) {
-        error[0] = '\0';
-    }
-    char launcher_error[CLI_BUF_256] = {0};
-    bool launcher_restored =
-        previous_launcher_backing_valid
-            ? cbm_windows_launcher_replace_atomic(canonical_launcher, previous_launcher_backing,
-                                                  launcher_error, sizeof(launcher_error))
-            : (cli_windows_path_absent(canonical_launcher) ||
-               cbm_windows_launcher_remove_posix(canonical_launcher, launcher_error,
-                                                 sizeof(launcher_error)));
-    char current_error[CLI_BUF_256] = {0};
-    bool current_restored =
-        previous_state_valid
-            ? cbm_windows_current_v1_write_atomic(canonical_launcher, previous_state, current_error,
-                                                  sizeof(current_error))
-            : cli_windows_remove_current_if_present(canonical_launcher);
-    if (!launcher_restored || !current_restored) {
-        if (error && error_size > 0U) {
-            (void)snprintf(
-                error, error_size, "%s%s%s",
-                !launcher_restored
-                    ? (launcher_error[0] ? launcher_error : "canonical backing restoration failed")
-                    : "",
-                !launcher_restored && !current_restored ? "; " : "",
-                !current_restored
-                    ? (current_error[0] ? current_error : "current-v1 restoration failed")
-                    : "");
-        }
-        return false;
-    }
-    return true;
-}
-
-static bool cli_windows_stage_private_file(
-    const char *source, const char *target,
-    char fingerprint_out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]) {
-    cbm_activation_transaction_t *transaction = NULL;
-    cbm_activation_transaction_status_t status =
-        cbm_activation_transaction_stage_file(target, source, &transaction);
-    cli_binary_validator_t validator = {{0}};
-    /* Each transaction step reports separately: a directory-validation
-     * refusal, a build-identity mismatch, and a commit failure are three
-     * different bugs, and the caller's single boolean previously collapsed
-     * them into one blind "staging failed" with no OS error code. */
-    bool ready = status == CBM_ACTIVATION_TRANSACTION_OK && transaction;
-    if (!ready) {
-        const char *refusal = cbm_activation_transaction_refusal_note();
-        (void)fprintf(stderr, "error: staging transaction open failed (status %d, os %lu%s%s)\n",
-                      (int)status, (unsigned long)GetLastError(), refusal[0] ? ": " : "", refusal);
-    }
-    if (ready && !cli_activation_transaction_expected_build(transaction, &validator)) {
-        (void)fprintf(stderr, "error: staged copy build-identity validation failed (os %lu)\n",
-                      (unsigned long)GetLastError());
-        ready = false;
-    }
-    if (ready && cli_activation_transaction_commit_validated(transaction, &validator,
-                                                             CLI_OCTAL_PERM) != CLI_OK) {
-        (void)fprintf(stderr, "error: staging transaction commit failed (os %lu)\n",
-                      (unsigned long)GetLastError());
-        ready = false;
-    }
-    if (ready && cli_activation_transaction_finalize_close(&transaction) != CLI_OK) {
-        (void)fprintf(stderr, "error: staging transaction finalize failed (os %lu)\n",
-                      (unsigned long)GetLastError());
-        ready = false;
-    }
-    (void)cli_activation_transaction_abort(&transaction);
-    if (ready && fingerprint_out) {
-        (void)snprintf(fingerprint_out, CBM_DAEMON_BUILD_FINGERPRINT_SIZE, "%s",
-                       validator.fingerprint);
-    }
-    return ready;
-}
-
-static bool cli_windows_stage_private_bytes(
-    const unsigned char *bytes, size_t bytes_size, const char *target,
-    char fingerprint_out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]) {
-    if (!bytes || bytes_size == 0 || !target || !target[0]) {
-        return false;
-    }
-    cbm_activation_transaction_t *transaction = NULL;
-    cbm_activation_transaction_status_t status =
-        cbm_activation_transaction_stage_bytes(target, bytes, bytes_size, &transaction);
-    cli_binary_validator_t validator = {{0}};
-    bool ready = status == CBM_ACTIVATION_TRANSACTION_OK && transaction &&
-                 cli_activation_transaction_expected_build(transaction, &validator) &&
-                 cli_activation_transaction_commit_validated(transaction, &validator,
-                                                             CLI_OCTAL_PERM) == CLI_OK &&
-                 cli_activation_transaction_finalize_close(&transaction) == CLI_OK;
-    (void)cli_activation_transaction_abort(&transaction);
-    if (ready && fingerprint_out) {
-        (void)snprintf(fingerprint_out, CBM_DAEMON_BUILD_FINGERPRINT_SIZE, "%s",
-                       validator.fingerprint);
-    }
-    return ready;
-}
-
-/* Per-user staging root for Windows install/update transactions. The
- * activation transaction and the release-descriptor probe validate the FULL
- * ancestor chain of everything they stage (trusted owner and no foreign
- * mutation grant on any path component). The process temp root routinely
- * fails that walk through no fault of ours: under msys2, TMP resolves
- * inside the msys install tree (C:\msys64\tmp), and on GitHub runners
- * inside the runner work directory, both of which carry broad inherited
- * grants such as Authenticated Users modify on an upper component. The
- * profile's AppData\Local chain is user-owned end to end, so staging there
- * satisfies the strict walk by construction instead of by environment
- * luck. */
-static const char *cli_windows_staging_root(char root_out[CLI_BUF_1K]) {
-    char base[CLI_BUF_1K];
-    if (!cbm_safe_getenv("LOCALAPPDATA", base, sizeof(base), NULL) || !base[0]) {
-        char profile[CLI_BUF_1K];
-        if (!cbm_safe_getenv("USERPROFILE", profile, sizeof(profile), NULL) || !profile[0]) {
-            return cbm_tmpdir();
-        }
-        int base_length = snprintf(base, sizeof(base), "%s/AppData/Local", profile);
-        if (base_length <= 0 || (size_t)base_length >= sizeof(base)) {
-            return cbm_tmpdir();
-        }
-    }
-    /* msys/CI harnesses export profile variables in POSIX drive form
-     * ("/c/Users/..."); the CRT cannot resolve that, so rewrite it to the
-     * native "C:/Users/..." form before building the root. */
-    if (base[0] == '/' &&
-        ((base[1] >= 'a' && base[1] <= 'z') || (base[1] >= 'A' && base[1] <= 'Z')) &&
-        (base[2] == '/' || base[2] == '\0')) {
-        char drive = base[1];
-        char rest[CLI_BUF_1K];
-        (void)snprintf(rest, sizeof(rest), "%s", base + 2);
-        (void)snprintf(base, sizeof(base), "%c:%s", drive, rest[0] ? rest : "/");
-    }
-    int written = snprintf(root_out, CLI_BUF_1K, "%s/codebase-memory-mcp", base);
-    if (written <= 0 || written >= CLI_BUF_1K) {
-        return cbm_tmpdir();
-    }
-    /* Create the whole chain: harness environments point LOCALAPPDATA at a
-     * fake profile whose AppData\Local ancestors do not exist on disk yet,
-     * and a single-level mkdir silently leaves the root missing. */
-    for (int index = 3; root_out[index] != '\0'; index++) {
-        if (root_out[index] != '/' && root_out[index] != '\\') {
-            continue;
-        }
-        char saved = root_out[index];
-        root_out[index] = '\0';
-        (void)_mkdir(root_out);
-        root_out[index] = saved;
-    }
-    (void)_mkdir(root_out);
-    DWORD attributes = GetFileAttributesA(root_out);
-    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
-        return cbm_tmpdir();
-    }
-    return root_out;
-}
-
-static bool cli_windows_prepare_install_pair(const wchar_t *launcher_source,
-                                             const wchar_t *payload_source,
-                                             const char expected_payload_sha256[65],
-                                             wchar_t launcher_out[CBM_WINDOWS_LAUNCHER_PATH_CAP],
-                                             wchar_t payload_out[CBM_WINDOWS_LAUNCHER_PATH_CAP],
-                                             char directory_out[CLI_BUF_1K]) {
-    char *launcher_source_utf8 = cbm_wide_to_utf8(launcher_source);
-    char *payload_source_utf8 = cbm_wide_to_utf8(payload_source);
-    char staging_root[CLI_BUF_1K];
-    int directory_length = snprintf(directory_out, CLI_BUF_1K, "%s/cbm-win-install-XXXXXX",
-                                    cli_windows_staging_root(staging_root));
-    bool ready = launcher_source_utf8 && payload_source_utf8 && directory_length > 0 &&
-                 directory_length < CLI_BUF_1K && cbm_mkdtemp(directory_out);
-    if (!ready) {
-        (void)fprintf(stderr, "error: could not create the private staging directory (%s)\n",
-                      directory_out);
-    }
-    char launcher_target[CLI_BUF_1K];
-    char payload_target[CLI_BUF_1K];
-    int launcher_length = ready ? snprintf(launcher_target, sizeof(launcher_target),
-                                           "%s/codebase-memory-mcp.exe", directory_out)
-                                : CLI_ERR;
-    int payload_length = ready ? snprintf(payload_target, sizeof(payload_target),
-                                          "%s/codebase-memory-mcp.payload.exe", directory_out)
-                               : CLI_ERR;
-    ready = ready && launcher_length > 0 && (size_t)launcher_length < sizeof(launcher_target) &&
-            payload_length > 0 && (size_t)payload_length < sizeof(payload_target);
-    char launcher_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
-    char payload_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
-    /* Each sub-step is checked separately so a staging failure is
-     * distinguishable from a fingerprint mismatch or an unrunnable staged
-     * launcher: the caller's single "did not remain runnable" message hides
-     * which one failed, and cbm_exec_no_shell does not inherit the child's
-     * stderr, so the launcher's own refusal reason never reaches the log. */
-    if (ready && !cli_windows_stage_private_file(launcher_source_utf8, launcher_target,
-                                                 launcher_fingerprint)) {
-        (void)fprintf(stderr, "error: private staging failed for the launcher (%s)\n",
-                      launcher_target);
-        ready = false;
-    }
-    if (ready &&
-        !cli_windows_stage_private_file(payload_source_utf8, payload_target, payload_fingerprint)) {
-        (void)fprintf(stderr, "error: private staging failed for the payload (%s)\n",
-                      payload_target);
-        ready = false;
-    }
-    if (ready && strcmp(payload_fingerprint, expected_payload_sha256) != 0) {
-        (void)fprintf(
-            stderr, "error: staged payload build fingerprint did not match the expected payload\n");
-        ready = false;
-    }
-    if (ready) {
-        const char *version_argv[] = {launcher_target, "--version", NULL};
-        if (cbm_exec_no_shell(version_argv) != CLI_OK) {
-            (void)fprintf(stderr,
-                          "error: the staged launcher did not run (--version probe failed)\n");
-            ready = false;
-        }
-    }
-    wchar_t *launcher_wide = ready ? cbm_utf8_to_wide(launcher_target) : NULL;
-    wchar_t *payload_wide = ready ? cbm_utf8_to_wide(payload_target) : NULL;
-    if (ready && launcher_wide && payload_wide) {
-        (void)_snwprintf_s(launcher_out, CBM_WINDOWS_LAUNCHER_PATH_CAP, _TRUNCATE, L"%ls",
-                           launcher_wide);
-        (void)_snwprintf_s(payload_out, CBM_WINDOWS_LAUNCHER_PATH_CAP, _TRUNCATE, L"%ls",
-                           payload_wide);
-    } else {
-        ready = false;
-    }
-    free(launcher_wide);
-    free(payload_wide);
-    free(launcher_source_utf8);
-    free(payload_source_utf8);
-    if (!ready) {
-        if (launcher_length > 0 && (size_t)launcher_length < sizeof(launcher_target)) {
-            (void)cbm_unlink(launcher_target);
-        }
-        if (payload_length > 0 && (size_t)payload_length < sizeof(payload_target)) {
-            (void)cbm_unlink(payload_target);
-        }
-        if (directory_out[0]) {
-            (void)cbm_rmdir(directory_out);
-        }
-        directory_out[0] = '\0';
-    }
-    return ready;
-}
-
-static void cli_windows_cleanup_install_pair(const wchar_t *launcher, const wchar_t *payload,
-                                             const char *directory) {
-    char *launcher_utf8 = cbm_wide_to_utf8(launcher);
-    char *payload_utf8 = cbm_wide_to_utf8(payload);
-    if (launcher_utf8) {
-        (void)cbm_unlink(launcher_utf8);
-    }
-    if (payload_utf8) {
-        (void)cbm_unlink(payload_utf8);
-    }
-    if (directory && directory[0]) {
-        (void)cbm_rmdir(directory);
-    }
-    free(launcher_utf8);
-    free(payload_utf8);
-}
-
-static bool cli_windows_prepare_update_pair(const cbm_windows_release_pair_t *pair,
-                                            const char expected_payload_sha256[65],
-                                            wchar_t launcher_out[CBM_WINDOWS_LAUNCHER_PATH_CAP],
-                                            wchar_t payload_out[CBM_WINDOWS_LAUNCHER_PATH_CAP],
-                                            char directory_out[CLI_BUF_1K]) {
-    if (!pair || !pair->launcher || pair->launcher_len <= 0 || !pair->payload ||
-        pair->payload_len <= 0 || !expected_payload_sha256) {
-        return false;
-    }
-    char staging_root[CLI_BUF_1K];
-    int directory_length = snprintf(directory_out, CLI_BUF_1K, "%s/cbm-win-update-XXXXXX",
-                                    cli_windows_staging_root(staging_root));
-    bool ready =
-        directory_length > 0 && directory_length < CLI_BUF_1K && cbm_mkdtemp(directory_out);
-    if (!ready) {
-        (void)fprintf(stderr, "error: could not create the private staging directory (%s)\n",
-                      directory_out);
-    }
-    char launcher_target[CLI_BUF_1K];
-    char payload_target[CLI_BUF_1K];
-    int launcher_length = ready ? snprintf(launcher_target, sizeof(launcher_target),
-                                           "%s/codebase-memory-mcp.exe", directory_out)
-                                : CLI_ERR;
-    int payload_length = ready ? snprintf(payload_target, sizeof(payload_target),
-                                          "%s/codebase-memory-mcp.payload.exe", directory_out)
-                               : CLI_ERR;
-    ready = ready && launcher_length > 0 && (size_t)launcher_length < sizeof(launcher_target) &&
-            payload_length > 0 && (size_t)payload_length < sizeof(payload_target);
-    char payload_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
-    ready = ready &&
-            cli_windows_stage_private_bytes(pair->launcher, (size_t)pair->launcher_len,
-                                            launcher_target, NULL) &&
-            cli_windows_stage_private_bytes(pair->payload, (size_t)pair->payload_len,
-                                            payload_target, payload_fingerprint) &&
-            strcmp(payload_fingerprint, expected_payload_sha256) == 0;
-    const char *version_argv[] = {launcher_target, "--version", NULL};
-    ready = ready && cbm_exec_no_shell(version_argv) == CLI_OK;
-    wchar_t *launcher_wide = ready ? cbm_utf8_to_wide(launcher_target) : NULL;
-    wchar_t *payload_wide = ready ? cbm_utf8_to_wide(payload_target) : NULL;
-    if (ready && launcher_wide && payload_wide) {
-        int launcher_copied = _snwprintf_s(launcher_out, CBM_WINDOWS_LAUNCHER_PATH_CAP, _TRUNCATE,
-                                           L"%ls", launcher_wide);
-        int payload_copied = _snwprintf_s(payload_out, CBM_WINDOWS_LAUNCHER_PATH_CAP, _TRUNCATE,
-                                          L"%ls", payload_wide);
-        ready = launcher_copied > 0 && payload_copied > 0;
-    } else {
-        ready = false;
-    }
-    free(launcher_wide);
-    free(payload_wide);
-    if (!ready) {
-        if (launcher_length > 0 && (size_t)launcher_length < sizeof(launcher_target)) {
-            (void)cbm_unlink(launcher_target);
-        }
-        if (payload_length > 0 && (size_t)payload_length < sizeof(payload_target)) {
-            (void)cbm_unlink(payload_target);
-        }
-        if (directory_out[0]) {
-            (void)cbm_rmdir(directory_out);
-        }
-        directory_out[0] = '\0';
-    }
-    return ready;
-}
-
-static int cli_windows_managed_install_activate(void *opaque) {
-    cli_windows_install_activation_t *activation = opaque;
-    if (!activation || !activation->home || !activation->bin_dir || !activation->bin_target) {
-        return CLI_TRUE;
-    }
-    int activation_status = CLI_OK;
-    if (activation->dry_run) {
-        printf("Would install managed launcher -> %s\n(dry-run — no files were modified)\n\n",
-               activation->bin_target);
-    } else {
-        bool generation_created = false;
-        bool launcher_committed = false;
-        bool current_committed = false;
-        char error[CLI_BUF_512] = {0};
-        cbm_windows_current_v1_t observed_current;
-        bool observed_current_exists = false;
-        wchar_t observed_backing[CBM_WINDOWS_LAUNCHER_PATH_CAP] = {0};
-        bool current_unchanged =
-            cli_windows_read_current(activation->canonical_launcher, &observed_current,
-                                     &observed_current_exists) &&
-            observed_current_exists == activation->previous_state_valid &&
-            (!observed_current_exists ||
-             cli_windows_current_equal(&observed_current, &activation->previous_state));
-        bool backing_unchanged =
-            activation->previous_launcher_backing_valid
-                ? (cbm_windows_managed_launcher_backing(
-                       activation->canonical_launcher, observed_backing,
-                       CBM_WINDOWS_LAUNCHER_PATH_CAP, error, sizeof(error)) &&
-                   _wcsicmp(observed_backing, activation->previous_launcher_backing) == 0)
-                : cli_windows_path_absent(activation->canonical_launcher);
-        bool previous_pair_unchanged = current_unchanged && backing_unchanged;
-        if (!previous_pair_unchanged) {
-            (void)fprintf(stderr, "error: managed Windows launcher/current state changed before "
-                                  "install activation; no generation was published\n");
-            return CLI_TRUE;
-        }
-        wchar_t generation_launcher[CBM_WINDOWS_LAUNCHER_PATH_CAP] = {0};
-        bool generation_ready = cli_windows_publish_generation(
-            activation->canonical_launcher, activation->launcher_source, activation->payload_source,
-            &activation->state, &generation_created);
-        generation_ready = generation_ready &&
-                           cbm_windows_generation_launcher_path(
-                               activation->canonical_launcher, activation->state.payload_sha256,
-                               generation_launcher, CBM_WINDOWS_LAUNCHER_PATH_CAP);
-        if (generation_ready &&
-            activation->transition_plan == CBM_WINDOWS_TRANSITION_CURRENT_FIRST) {
-            current_committed = cbm_windows_current_v1_write_atomic(
-                activation->canonical_launcher, &activation->state, error, sizeof(error));
-            launcher_committed =
-                current_committed &&
-                cbm_windows_launcher_replace_atomic(activation->canonical_launcher,
-                                                    generation_launcher, error, sizeof(error));
-        } else if (generation_ready) {
-            launcher_committed = cbm_windows_launcher_replace_atomic(
-                activation->canonical_launcher, generation_launcher, error, sizeof(error));
-            current_committed = launcher_committed && cbm_windows_current_v1_write_atomic(
-                                                          activation->canonical_launcher,
-                                                          &activation->state, error, sizeof(error));
-        }
-        if (!generation_ready || !launcher_committed || !current_committed) {
-            char restore_error[CLI_BUF_512] = {0};
-            bool restored = cli_windows_restore_managed_pair(
-                activation->canonical_launcher, activation->previous_launcher_backing,
-                activation->previous_launcher_backing_valid, &activation->previous_state,
-                activation->previous_state_valid, restore_error, sizeof(restore_error));
-            if (!restored) {
-                (void)fprintf(stderr,
-                              "error: managed Windows install could not restore the "
-                              "previous launcher/current pair: %s\n",
-                              restore_error[0] ? restore_error : "atomic restoration failed");
-            }
-            char rollback_error[CLI_BUF_256] = {0};
-            bool generation_rolled_back = cbm_windows_generation_rollback_if_unreferenced(
-                activation->canonical_launcher, activation->state.payload_sha256,
-                generation_created, rollback_error, sizeof(rollback_error));
-            if (!generation_rolled_back) {
-                (void)fprintf(stderr,
-                              "error: managed Windows install generation rollback "
-                              "failed: %s\n",
-                              rollback_error[0] ? rollback_error
-                                                : "generation remains for safe recovery");
-            }
-            if (activation->initial_install && !activation->previous_launcher_backing_valid &&
-                generation_created && restored && generation_rolled_back) {
-                cli_windows_remove_empty_managed_state(activation->canonical_launcher);
-            }
-            (void)fprintf(stderr, "error: managed Windows install commit failed: %s\n",
-                          error[0] ? error : "generation/launcher/current publish failed");
-            return CLI_TRUE;
-        }
-        size_t generations_removed = 0U;
-        char prune_error[CLI_BUF_256] = {0};
-        if (!cbm_windows_generations_prune(activation->canonical_launcher, &generations_removed,
-                                           prune_error, sizeof(prune_error))) {
-            (void)fprintf(stderr,
-                          "error: managed Windows install committed, but old "
-                          "generation pruning was incomplete: %s\n",
-                          prune_error[0] ? prune_error : "unsafe generation entry");
-            activation_status = CLI_ACTIVATION_PARTIAL;
-        }
-        printf("Installed managed launcher -> %s\n\n", activation->bin_target);
-    }
-
-    if (!activation->skip_config &&
-        cbm_install_agent_configs(activation->home, activation->bin_target, activation->force,
-                                  activation->dry_run) != CLI_OK) {
-        (void)fprintf(stderr, "error: managed launcher was kept, but one or more agent "
-                              "configuration updates failed\n");
-        return CLI_ACTIVATION_PARTIAL;
-    }
-    int path_status = cli_ensure_windows_user_path(
-        activation->bin_dir, activation->dry_run || g_cli_activation_test_ops_set);
-    if (path_status == CLI_ERR) {
-        (void)fprintf(stderr, "error: managed launcher was kept, but current-user PATH "
-                              "configuration failed\n");
-        return CLI_ACTIVATION_PARTIAL;
-    }
-    if (path_status == CLI_OK) {
-        printf("\nAdded %s to the current-user PATH\n", activation->bin_dir);
-    } else {
-        printf("\nPATH already includes %s\n", activation->bin_dir);
-    }
-    if (!activation->dry_run && activation->delete_indexes) {
-        int expected = count_db_indexes(activation->home);
-        int removed = cbm_remove_indexes(activation->home);
-        printf("Removed %d index(es).\n\n", removed);
-        if (removed != expected) {
-            (void)fprintf(stderr, "error: only %d of %d indexes could be removed\n", removed,
-                          expected);
-            return CLI_ACTIVATION_PARTIAL;
-        }
-    }
-    return activation_status;
-}
-
-static int cli_windows_managed_install(const char *home, const char *requested_bin_dir,
-                                       bool dry_run, bool force, bool reset_indexes,
-                                       bool skip_config) {
-    char default_dir[CLI_BUF_1K];
-    const char *directory_input = requested_bin_dir;
-    if (!directory_input) {
-        int written = snprintf(default_dir, sizeof(default_dir), "%s/.local/bin", home);
-        if (written <= 0 || (size_t)written >= sizeof(default_dir)) {
-            return CLI_TRUE;
-        }
-        directory_input = default_dir;
-    }
-
-    wchar_t *requested_wide = cli_windows_utf8_to_wide(directory_input);
-    wchar_t full_directory[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    DWORD full_length =
-        requested_wide
-            ? GetFullPathNameW(requested_wide, CBM_WINDOWS_LAUNCHER_PATH_CAP, full_directory, NULL)
-            : 0;
-    free(requested_wide);
-    if (full_length == 0 || full_length >= CBM_WINDOWS_LAUNCHER_PATH_CAP) {
-        (void)fprintf(stderr, "error: install directory could not be resolved\n");
-        return CLI_TRUE;
-    }
-
-    wchar_t canonical_launcher[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    wchar_t payload_source[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    wchar_t launcher_source[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    if (!cli_windows_join_path(full_directory, L"codebase-memory-mcp.exe", canonical_launcher,
-                               CBM_WINDOWS_LAUNCHER_PATH_CAP) ||
-        !cli_windows_module_path(payload_source) ||
-        !cli_windows_regular_file_no_reparse(payload_source, NULL) ||
-        !cli_windows_install_source_launcher(payload_source, launcher_source)) {
-        (void)fprintf(stderr, "error: managed install requires a verified adjacent "
-                              "codebase-memory-mcp.exe launcher (or an authenticated existing "
-                              "managed launcher)\n");
-        return CLI_TRUE;
-    }
-
-    char *bin_dir = cbm_wide_to_utf8(full_directory);
-    char *bin_target = cli_windows_plain_utf8(canonical_launcher);
-    char *payload_utf8 = cbm_wide_to_utf8(payload_source);
-    char *launcher_utf8 = cbm_wide_to_utf8(launcher_source);
-    char fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
-    char launcher_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
-    uint64_t payload_size = 0;
-    bool sources_valid = bin_dir && bin_target && payload_utf8 && launcher_utf8 &&
-                         cli_windows_regular_file_no_reparse(payload_source, &payload_size) &&
-                         cbm_daemon_build_fingerprint_file(payload_utf8, fingerprint) &&
-                         cbm_daemon_build_fingerprint_file(launcher_utf8, launcher_fingerprint);
-    if (!sources_valid) {
-        (void)fprintf(stderr, "error: launcher/payload source verification failed before "
-                              "managed install\n");
-        free(bin_dir);
-        free(bin_target);
-        free(payload_utf8);
-        free(launcher_utf8);
-        return CLI_TRUE;
-    }
-
-    wchar_t prepared_launcher[CBM_WINDOWS_LAUNCHER_PATH_CAP] = {0};
-    wchar_t prepared_payload[CBM_WINDOWS_LAUNCHER_PATH_CAP] = {0};
-    char prepared_directory[CLI_BUF_1K] = {0};
-    bool pair_prepared = false;
-    cbm_windows_release_descriptor_v1_t descriptor = {
-        .launcher_abi = CBM_WINDOWS_LAUNCHER_ABI_CURRENT,
-        .payload_launcher_abi_min = CBM_WINDOWS_PAYLOAD_LAUNCHER_ABI_MIN,
-        .payload_launcher_abi_max = CBM_WINDOWS_PAYLOAD_LAUNCHER_ABI_MAX,
-        .payload_size = payload_size,
-    };
-    (void)snprintf(descriptor.payload_sha256, sizeof(descriptor.payload_sha256), "%s", fingerprint);
-
-    cbm_windows_current_v1_t previous;
-    memset(&previous, 0, sizeof(previous));
-    bool current_exists = false;
-    bool current_valid = cli_windows_read_current(canonical_launcher, &previous, &current_exists);
-    DWORD launcher_attributes = GetFileAttributesW(canonical_launcher);
-    DWORD launcher_attribute_error =
-        launcher_attributes == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_SUCCESS;
-    bool launcher_exists = launcher_attributes != INVALID_FILE_ATTRIBUTES;
-    bool launcher_absent = launcher_attributes == INVALID_FILE_ATTRIBUTES &&
-                           (launcher_attribute_error == ERROR_FILE_NOT_FOUND ||
-                            launcher_attribute_error == ERROR_PATH_NOT_FOUND);
-    const char *current_version_argv[] = {bin_target, "--version", NULL};
-    char target_error[CLI_BUF_512] = {0};
-    wchar_t target_backing[CBM_WINDOWS_LAUNCHER_PATH_CAP] = {0};
-    bool current_target_secure =
-        launcher_exists && cbm_windows_managed_launcher_backing(canonical_launcher, target_backing,
-                                                                CBM_WINDOWS_LAUNCHER_PATH_CAP,
-                                                                target_error, sizeof(target_error));
-    /* A crash between the fresh install's atomic launcher publication and
-     * current-v1 publication leaves one recognizable partial state. Repair it
-     * only when canonical is the exact second link of this candidate's complete
-     * generation. An arbitrary launcher/current mismatch remains a hard
-     * conflict. */
-    cbm_windows_current_v1_t interrupted_state = {
-        .launcher_abi_min = descriptor.payload_launcher_abi_min,
-        .launcher_abi_max = descriptor.payload_launcher_abi_max,
-        .payload_size = descriptor.payload_size,
-    };
-    (void)snprintf(interrupted_state.payload_sha256, sizeof(interrupted_state.payload_sha256), "%s",
-                   fingerprint);
-    bool interrupted_initial_install =
-        current_valid && !current_exists && launcher_exists && current_target_secure &&
-        cbm_windows_generation_payload_path(canonical_launcher, fingerprint, prepared_payload,
-                                            CBM_WINDOWS_LAUNCHER_PATH_CAP) &&
-        cbm_windows_generation_launcher_path(canonical_launcher, fingerprint, prepared_launcher,
-                                             CBM_WINDOWS_LAUNCHER_PATH_CAP) &&
-        _wcsicmp(target_backing, prepared_launcher) == 0 &&
-        cli_windows_generation_pair_valid(canonical_launcher, prepared_payload, prepared_launcher,
-                                          &interrupted_state, launcher_fingerprint);
-    bool fresh_target = current_valid && !current_exists && launcher_absent;
-    bool intact_target = current_valid && current_exists && current_target_secure;
-    /* A launcher-first initial-install crash intentionally has no current-v1
-     * yet. Executing canonical in that state must fail closed (it cannot select
-     * a managed payload and its two-link layout forbids portable mode). The
-     * exact generation identities above authenticate that recovery state; the
-     * copied source pair is executed again during private staging below. */
-    bool current_pair_runnable =
-        fresh_target || interrupted_initial_install ||
-        (intact_target && cbm_exec_no_shell(current_version_argv) == CLI_OK);
-    if ((!fresh_target && !intact_target && !interrupted_initial_install) ||
-        !current_pair_runnable) {
-        (void)fprintf(stderr,
-                      "error: target is not an intact compatible managed Windows "
-                      "installation; remove the conflicting files before install%s%s\n",
-                      target_error[0] ? ": " : "", target_error[0] ? target_error : "");
-        free(bin_dir);
-        free(bin_target);
-        free(payload_utf8);
-        free(launcher_utf8);
-        return CLI_TRUE;
-    }
-
-    if (!dry_run) {
-        pair_prepared = cli_windows_prepare_install_pair(launcher_source, payload_source,
-                                                         fingerprint, prepared_launcher,
-                                                         prepared_payload, prepared_directory);
-        if (!pair_prepared) {
-            (void)fprintf(stderr, "error: launcher/payload source pair did not remain "
-                                  "runnable after private staging\n");
-            free(bin_dir);
-            free(bin_target);
-            free(payload_utf8);
-            free(launcher_utf8);
-            return CLI_TRUE;
-        }
-        char probe_error[CLI_BUF_512] = {0};
-        if (!cbm_windows_release_descriptor_probe(prepared_launcher, &descriptor, probe_error,
-                                                  sizeof(probe_error)) ||
-            descriptor.payload_size != payload_size ||
-            strcmp(descriptor.payload_sha256, fingerprint) != 0) {
-            (void)fprintf(stderr,
-                          "error: managed Windows install release descriptor is "
-                          "invalid or does not match the staged payload before "
-                          "stopping CBM sessions: %s\n",
-                          probe_error[0] ? probe_error : "payload identity mismatch");
-            cli_windows_cleanup_install_pair(prepared_launcher, prepared_payload,
-                                             prepared_directory);
-            free(bin_dir);
-            free(bin_target);
-            free(payload_utf8);
-            free(launcher_utf8);
-            return CLI_TRUE;
-        }
-        cbm_windows_transition_plan_t candidate_plan =
-            current_exists ? cbm_windows_transition_plan(&previous, &descriptor)
-                           : CBM_WINDOWS_TRANSITION_LAUNCHER_FIRST;
-        if (candidate_plan == CBM_WINDOWS_TRANSITION_INCOMPATIBLE) {
-            (void)fprintf(stderr, "error: managed Windows install requires an intermediate "
-                                  "launcher ABI bridge; active CBM sessions were not stopped\n");
-            cli_windows_cleanup_install_pair(prepared_launcher, prepared_payload,
-                                             prepared_directory);
-            free(bin_dir);
-            free(bin_target);
-            free(payload_utf8);
-            free(launcher_utf8);
-            return CLI_TRUE;
-        }
-        if (!cbm_windows_launcher_capability_probe(full_directory, prepared_launcher, probe_error,
-                                                   sizeof(probe_error))) {
-            (void)fprintf(stderr,
-                          "error: managed launcher capability probe failed before "
-                          "stopping CBM sessions: %s\n",
-                          probe_error[0] ? probe_error
-                                         : "local fixed NTFS atomic replacement is unavailable");
-            cli_windows_cleanup_install_pair(prepared_launcher, prepared_payload,
-                                             prepared_directory);
-            free(bin_dir);
-            free(bin_target);
-            free(payload_utf8);
-            free(launcher_utf8);
-            return CLI_TRUE;
-        }
-    }
-
-    bool delete_indexes = false;
-    if (cbm_install_prepare_existing_indexes(home, reset_indexes, dry_run, &delete_indexes) == 0) {
-        if (pair_prepared) {
-            cli_windows_cleanup_install_pair(prepared_launcher, prepared_payload,
-                                             prepared_directory);
-        }
-        free(bin_dir);
-        free(bin_target);
-        free(payload_utf8);
-        free(launcher_utf8);
-        return CLI_TRUE;
-    }
-    cbm_windows_current_v1_t state = {
-        .launcher_abi_min = descriptor.payload_launcher_abi_min,
-        .launcher_abi_max = descriptor.payload_launcher_abi_max,
-        .payload_size = descriptor.payload_size,
-    };
-    (void)snprintf(state.payload_sha256, sizeof(state.payload_sha256), "%s", fingerprint);
-    cli_windows_install_activation_t activation = {
-        .home = home,
-        .bin_dir = bin_dir,
-        .bin_target = bin_target,
-        .state = state,
-        .previous_state = previous,
-        .transition_plan = current_exists ? cbm_windows_transition_plan(&previous, &descriptor)
-                                          : CBM_WINDOWS_TRANSITION_LAUNCHER_FIRST,
-        .initial_install = !current_exists,
-        .previous_state_valid = current_exists,
-        .previous_launcher_backing_valid = launcher_exists,
-        .delete_indexes = delete_indexes,
-        .skip_config = skip_config,
-        .force = force,
-        .dry_run = dry_run,
-    };
-    memcpy(activation.canonical_launcher, canonical_launcher, sizeof(canonical_launcher));
-    if (launcher_exists) {
-        memcpy(activation.previous_launcher_backing, target_backing, sizeof(target_backing));
-    }
-    memcpy(activation.launcher_source, pair_prepared ? prepared_launcher : launcher_source,
-           sizeof(launcher_source));
-    memcpy(activation.payload_source, pair_prepared ? prepared_payload : payload_source,
-           sizeof(payload_source));
-    int result = dry_run ? cli_windows_managed_install_activate(&activation)
-                         : cli_activation_guard(CBM_DAEMON_RUNTIME_ACTIVATION_INSTALL, CBM_VERSION,
-                                                state.payload_sha256,
-                                                cli_windows_managed_install_activate, &activation);
-    if (pair_prepared) {
-        cli_windows_cleanup_install_pair(prepared_launcher, prepared_payload, prepared_directory);
-    }
-    free(bin_dir);
-    free(bin_target);
-    free(payload_utf8);
-    free(launcher_utf8);
-    return result == CLI_OK ? CLI_OK : CLI_TRUE;
-}
-#endif
 
 int cbm_cmd_install(int argc, char **argv) {
     parse_auto_answer(argc, argv);
@@ -10461,6 +9997,9 @@ int cbm_cmd_install(int argc, char **argv) {
     bool plan = false;
     bool reset_indexes = false;
     bool skip_config = false;
+    bool skip_binary = false;
+    bool force_binary = false;
+    const char *requested_clients = NULL;
     const char *requested_bin_dir = NULL;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--dry-run") == 0) {
@@ -10473,6 +10012,24 @@ int cbm_cmd_install(int argc, char **argv) {
             reset_indexes = true;
         } else if (strcmp(argv[i], "--skip-config") == 0) {
             skip_config = true;
+        } else if (strncmp(argv[i], "--clients=", SLEN("--clients=")) == 0) {
+            requested_clients = argv[i] + SLEN("--clients=");
+            if (!requested_clients[0]) {
+                (void)fprintf(stderr, "error: --clients requires a value\n\n");
+                cli_clients_print_list(stderr);
+                return CLI_TRUE;
+            }
+        } else if (strcmp(argv[i], "--clients") == 0) {
+            /* Bare `--clients` (and `--clients=help`/`list`) print the
+             * vocabulary. 26 clients ship with tokens nobody would guess. */
+            cli_clients_print_list(stdout);
+            return 0;
+        } else if (strcmp(argv[i], "--skip-binary") == 0) {
+            /* #1566: the mirror of --skip-config. Configure the agents, leave
+             * the binary and PATH alone. */
+            skip_binary = true;
+        } else if (strcmp(argv[i], "--force-binary") == 0) {
+            force_binary = true;
         } else if (strncmp(argv[i], "--dir=", SLEN("--dir=")) == 0) {
             requested_bin_dir = argv[i] + SLEN("--dir=");
             if (!requested_bin_dir[0]) {
@@ -10533,37 +10090,45 @@ int cbm_cmd_install(int argc, char **argv) {
         return 0;
     }
 
+    /* #1558: validate the client tokens BEFORE anything is written, so a typo
+     * fails immediately instead of part-way through configuring. */
+    if (requested_clients) {
+        cbm_detected_agents_t probe = cbm_detect_agents(home);
+        if (!cli_clients_apply_selection(requested_clients, &probe)) {
+            return CLI_TRUE;
+        }
+        g_client_selection = requested_clients;
+    }
+
     printf("codebase-memory-mcp install %s\n\n", CBM_VERSION);
 
-#ifdef _WIN32
-    /* Fail-closed dispatch polarity: the managed launcher transaction is the
-     * ONLY Windows install path a release binary contains. Test builds
-     * additionally compile the portable flow below, reachable solely through
-     * the activation test seam and loudly announced, so the shared
-     * activation/agent-config semantics stay unit-covered while a misroute
-     * can never pass silently. The real managed transaction has its own
-     * end-to-end gates (launcher guard, agent-config smoke, smoke-install). */
-#ifdef CBM_CLI_ENABLE_TEST_API
-    if (g_cli_activation_test_ops_set) {
-        (void)fprintf(stderr,
-                      "*** cbm test seam: portable install flow engaged; the managed Windows "
-                      "install transaction is bypassed (test builds only) ***\n");
-    } else
-#endif
-    {
-        return cli_windows_managed_install(home, requested_bin_dir, dry_run, force, reset_indexes,
-                                           skip_config);
-    }
-#endif
-
-#if !defined(_WIN32) || defined(CBM_CLI_ENABLE_TEST_API)
     char self_path[CLI_BUF_1K] = {0};
-    cbm_detect_self_path(self_path, sizeof(self_path), home);
+    bool self_path_exact = cbm_detect_self_path(self_path, sizeof(self_path), home);
 
-    struct stat target_status;
-    bool target_exists = (stat(bin_target, &target_status) == 0);
+    /* #1566: a binary owned by mise/Homebrew/nix is not ours to relocate. Infer
+     * it, and let either flag override the inference in either direction. */
+    bool externally_managed =
+        !force_binary && cli_binary_is_externally_managed(self_path, self_path_exact, bin_dir);
+    if (externally_managed || skip_binary) {
+        const char *manager = cli_external_manager_name(self_path);
+        if (skip_binary) {
+            printf("Skipping binary placement (--skip-binary); configuring agents only.\n\n");
+        } else {
+            printf("Binary is managed elsewhere%s%s:\n  %s\n"
+                   "Leaving it and your PATH untouched; configuring agents only.\n"
+                   "  (use --force-binary to install a copy into %s anyway)\n\n",
+                   manager ? " by " : "", manager ? manager : "", self_path, bin_dir);
+        }
+        skip_binary = true;
+    }
+
+    /* NOT stat(): on Windows it goes through the ANSI code page, so an
+     * extended-length or non-ASCII target reports "absent" and a non-force
+     * install silently overwrites bytes the user asked to keep. */
+    cbm_path_info_t target_status;
+    bool target_exists = cbm_path_info_utf8(bin_target, &target_status) == 0;
     bool same_binary = cbm_same_file(self_path, bin_target);
-    bool do_copy = !same_binary && (!target_exists || force);
+    bool do_copy = !skip_binary && !same_binary && (!target_exists || force);
 
     /* (#607) Default: preserve existing indexes. `--reset-indexes` opts into
      * the old prompt-and-delete behaviour. The helper returns 0 only when the
@@ -10739,6 +10304,7 @@ int cbm_cmd_install(int argc, char **argv) {
         .copy_binary = do_copy,
         .delete_indexes = delete_indexes,
         .skip_config = skip_config,
+        .skip_binary = skip_binary,
         .force = force,
         .dry_run = dry_run,
     };
@@ -10761,12 +10327,16 @@ int cbm_cmd_install(int argc, char **argv) {
          * so a non-OK here is a plan-side check (agent-config / PATH probe)
          * and must still report that it was a dry-run - on Windows it was
          * silently skipping the summary and reading as a hard failure. Emit
-         * the dry-run indicator, and name the underlying status for triage. */
+         * the dry-run indicator, and name the underlying status for triage.
+         *
+         * The status itself still travels: `--dry-run` exists to answer "would
+         * this install work?", so a refused plan check has to be visible to a
+         * caller that only sees the exit code. Reporting success here made a
+         * fail-closed PATH probe indistinguishable from a clean plan. */
         if (dry_run) {
             (void)fprintf(stderr, "note: install --dry-run plan check returned %d\n",
                           activation_rc);
             printf("\n(dry-run — no files were modified)\n");
-            return CLI_OK;
         }
         return CLI_TRUE;
     }
@@ -10780,7 +10350,6 @@ int cbm_cmd_install(int argc, char **argv) {
         printf("\n(dry-run — no files were modified)\n");
     }
     return 0;
-#endif /* !defined(_WIN32) || defined(CBM_CLI_ENABLE_TEST_API) */
 }
 
 /* ── Subcommand: uninstall ────────────────────────────────────── */
@@ -11089,6 +10658,9 @@ static void uninstall_pi_durable_context(const char *home, bool dry_run) {
     }
     printf("  instructions: removed managed context\n");
     uninstall_agent_skill("Pi", skills_dir, dry_run);
+    char extension_path[CLI_BUF_1K];
+    snprintf(extension_path, sizeof(extension_path), "%s/.pi/agent/extensions/cbmem.ts", home);
+    uninstall_generated_client_extension("Pi", extension_path, dry_run);
 }
 
 static void uninstall_managed_agent_instructions(const char *label, const char *instructions_path,
@@ -11345,34 +10917,57 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
         char ip[CLI_BUF_1K];
         char skills_dir[CLI_BUF_1K];
         char ap[CLI_BUF_1K];
+        char installed_binary[CLI_BUF_1K];
         cbm_codex_config_dir(home, config_dir, sizeof(config_dir));
         snprintf(cp, sizeof(cp), "%s/config.toml", config_dir);
         snprintf(ip, sizeof(ip), "%s/AGENTS.md", config_dir);
         snprintf(skills_dir, sizeof(skills_dir), "%s/skills", config_dir);
         snprintf(ap, sizeof(ap), "%s/agents/codebase-memory.toml", config_dir);
+        cbm_agent_installed_binary_path(home, installed_binary, sizeof(installed_binary));
+        char hook_command[CLI_BUF_8K];
+        char hook_command_windows[CLI_BUF_8K];
+        bool hook_command_ok = cbm_build_augment_command(installed_binary, hook_command,
+                                                         sizeof(hook_command)) == CLI_OK;
+        bool hook_commands_ok = hook_command_ok && cbm_build_augment_command_windows(
+                                                       installed_binary, hook_command_windows,
+                                                       sizeof(hook_command_windows)) == CLI_OK;
+        cbm_toml_codex_hook_failure_t preflight_failure = CBM_TOML_CODEX_HOOK_FAILURE_NONE;
+        bool hook_preflight_ok =
+            hook_commands_ok && cbm_reconcile_codex_hooks_command_detailed(
+                                    cp, hook_command, hook_command_windows,
+                                    CBM_TOML_CODEX_HOOK_REMOVE, true, &preflight_failure) == CLI_OK;
+        if (!hook_preflight_ok) {
+            printf("Codex CLI:\n");
+            fflush(stdout);
+            const char *reason = preflight_failure == CBM_TOML_CODEX_HOOK_FAILURE_NONE
+                                     ? NULL
+                                     : cbm_toml_codex_hook_failure_name(preflight_failure);
+            record_agent_config_error_with_reason(true, "Codex CLI", "hook_preflight", cp, reason);
+            goto codex_toml_done;
+        }
         uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Codex CLI", cp, ip}, dry_run,
                                   cbm_remove_codex_mcp_owned);
+        if (!dry_run &&
+            cbm_reconcile_codex_hooks_command(cp, hook_command, hook_command_windows,
+                                              CBM_TOML_CODEX_HOOK_REMOVE, false) != CLI_OK) {
+            record_agent_config_error(true, "Codex CLI", "hook_uninstall", cp);
+        }
+    codex_toml_done:
         uninstall_agent_skill("Codex CLI", skills_dir, dry_run);
         uninstall_tiered_agent_profiles(
             (cbm_tiered_profile_set_t){
                 .label = "Codex CLI",
                 .verify_path = ap,
+                .binary_path = installed_binary,
                 .legacy_verify_content = legacy_codex_verify_agent_content,
                 .dialect = CBM_GRAPH_DIALECT_CODEX,
             },
             dry_run);
         if (!dry_run) {
-            if (cbm_remove_codex_hooks(cp) != CLI_OK) {
-                record_agent_config_error(true, "Codex CLI", "hook_uninstall", cp);
-            }
             char hooks_json[CLI_BUF_1K];
-            char installed_binary[CLI_BUF_1K];
-            char hook_command[CLI_BUF_8K];
             snprintf(hooks_json, sizeof(hooks_json), "%s/hooks.json", config_dir);
-            cbm_agent_installed_binary_path(home, installed_binary, sizeof(installed_binary));
             if (cbm_file_exists(hooks_json) &&
-                (cbm_build_augment_command(installed_binary, hook_command, sizeof(hook_command)) !=
-                     CLI_OK ||
+                (!hook_command_ok ||
                  cbm_remove_paired_lifecycle_hooks_json(hooks_json, hook_command) != CLI_OK)) {
                 record_agent_config_error(true, "Codex CLI", "json_hook_uninstall", hooks_json);
             }
@@ -11401,6 +10996,10 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
                 .dialect = CBM_GRAPH_DIALECT_OPENCODE,
             },
             dry_run);
+        char plugin_path[CLI_BUF_1K];
+        snprintf(plugin_path, sizeof(plugin_path), "%s/.config/opencode/plugins/cbm-augment.ts",
+                 home);
+        uninstall_generated_client_extension("OpenCode", plugin_path, dry_run);
     }
     if (agents->antigravity) {
         char cp[CLI_BUF_1K];
@@ -11881,7 +11480,6 @@ static void uninstall_additional_agents(const cbm_detected_agents_t *agents, con
     }
 }
 
-#if !defined(_WIN32) || defined(CBM_CLI_ENABLE_TEST_API)
 typedef struct {
     const char *home;
     const char *bin_path;
@@ -11891,6 +11489,56 @@ typedef struct {
     bool delete_indexes;
     bool dry_run;
 } cli_uninstall_activation_t;
+
+/* Report — never delete — the updater script sitting next to the binary.
+ *
+ * install.sh/install.ps1 copies itself beside the executable so `update` has
+ * something to hand off to. Uninstall does NOT remove it, deliberately: we
+ * cannot prove we own that file. The user may have put their own copy there, it
+ * may be a symlink into a checkout, or a package manager may manage it. Deleting
+ * a file we merely expect to find is how an uninstaller eats something it
+ * shouldn't. Telling the user the exact path costs one line and leaves the
+ * decision with them. */
+static void cli_uninstall_report_leftover_installer(const char *bin_path, bool dry_run) {
+    if (!bin_path || !bin_path[0]) {
+        return;
+    }
+    const char *slash = strrchr(bin_path, '/');
+#ifdef _WIN32
+    const char *backslash = strrchr(bin_path, '\\');
+    if (backslash && (!slash || backslash > slash)) {
+        slash = backslash;
+    }
+    static const char *const installer_names[] = {"install.ps1", "install.sh"};
+#else
+    static const char *const installer_names[] = {"install.sh"};
+#endif
+    if (!slash || slash == bin_path) {
+        return;
+    }
+    size_t dir_len = (size_t)(slash - bin_path);
+    for (size_t i = 0; i < sizeof(installer_names) / sizeof(installer_names[0]); i++) {
+        char installer_path[CLI_BUF_1K];
+        int written = snprintf(installer_path, sizeof(installer_path), "%.*s/%s", (int)dir_len,
+                               bin_path, installer_names[i]);
+        if (written <= 0 || (size_t)written >= sizeof(installer_path)) {
+            continue;
+        }
+        struct stat installer_status;
+        if (stat(installer_path, &installer_status) != 0) {
+            continue;
+        }
+        if (dry_run) {
+            printf("Would leave %s in place (remove it yourself if you want it gone).\n",
+                   installer_path);
+        } else {
+            printf("\nLeft in place: %s\n"
+                   "  This is the updater; uninstall does not delete it because it cannot\n"
+                   "  prove it owns it. To remove it as well:\n\n    rm \"%s\"\n",
+                   installer_path, installer_path);
+        }
+    }
+}
 
 /* Uninstall is an activation too: removing the executable or its indexes
  * while a daemon generation is starting/running would leave live sessions on
@@ -11946,182 +11594,41 @@ static int cli_uninstall_activate(void *opaque) {
     if (activation->binary_exists) {
         printf("Removed %s\n", activation->bin_path);
     }
+    cli_uninstall_report_leftover_installer(activation->bin_path, activation->dry_run);
     return CLI_OK;
 }
-#endif /* !defined(_WIN32) || defined(CBM_CLI_ENABLE_TEST_API) */
-
-#ifdef _WIN32
-typedef struct {
-    const char *home;
-    const char *canonical_launcher_utf8;
-    wchar_t canonical_launcher[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    wchar_t launcher_backing[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    cbm_windows_current_v1_t state;
-    cbm_detected_agents_t agents;
-    bool delete_indexes;
-    bool dry_run;
-} cli_windows_uninstall_activation_t;
-
-static int cli_windows_managed_uninstall_activate(void *opaque) {
-    cli_windows_uninstall_activation_t *activation = opaque;
-    if (!activation || !activation->home || !activation->canonical_launcher_utf8) {
-        return CLI_TRUE;
-    }
-    cbm_windows_current_v1_t observed;
-    bool observed_exists = false;
-    wchar_t observed_backing[CBM_WINDOWS_LAUNCHER_PATH_CAP] = {0};
-    char validation_error[CLI_BUF_512] = {0};
-    if (!cli_windows_read_current(activation->canonical_launcher, &observed, &observed_exists) ||
-        !observed_exists || !cli_windows_current_equal(&observed, &activation->state) ||
-        !cbm_windows_managed_launcher_backing(activation->canonical_launcher, observed_backing,
-                                              CBM_WINDOWS_LAUNCHER_PATH_CAP, validation_error,
-                                              sizeof(validation_error)) ||
-        _wcsicmp(observed_backing, activation->launcher_backing) != 0) {
-        (void)fprintf(stderr,
-                      "error: managed Windows launcher/current state changed before "
-                      "uninstall activation; no configuration was removed%s%s\n",
-                      validation_error[0] ? ": " : "", validation_error[0] ? validation_error : "");
-        return CLI_TRUE;
-    }
-    if (activation->agents.claude_code) {
-        uninstall_claude_code(activation->home, activation->dry_run);
-    }
-    uninstall_cli_agents(&activation->agents, activation->home, activation->dry_run);
-    uninstall_editor_agents(&activation->agents, activation->home, activation->dry_run);
-    uninstall_additional_agents(&activation->agents, activation->home, activation->dry_run);
-    uninstall_agent_client_registry(activation->home, activation->dry_run);
-    if (g_agent_uninstall_errors != 0) {
-        (void)fprintf(stderr, "error: one or more agent cleanup operations failed; managed "
-                              "launcher and generation state were kept\n");
-        return CLI_ACTIVATION_PARTIAL;
-    }
-    if (activation->dry_run) {
-        printf("Would remove managed launcher and generation state -> %s\n",
-               activation->canonical_launcher_utf8);
-        return CLI_OK;
-    }
-
-    /* Finish every fallible cleanup before retiring managed state and
-     * unlinking the only public retry entry point. */
-    if (activation->delete_indexes) {
-        int expected = count_db_indexes(activation->home);
-        int removed = cbm_remove_indexes(activation->home);
-        printf("Removed %d index(es).\n", removed);
-        if (removed != expected) {
-            (void)fprintf(stderr, "error: only %d of %d indexes could be removed\n", removed,
-                          expected);
-            return CLI_ACTIVATION_PARTIAL;
-        }
-    }
-
-    char error[CLI_BUF_512] = {0};
-    if (!cbm_windows_launcher_uninstall_commit(activation->canonical_launcher,
-                                               activation->state.payload_sha256, error,
-                                               sizeof(error))) {
-        (void)fprintf(stderr, "error: managed launcher uninstall commit failed: %s\n",
-                      error[0] ? error : "state retirement or atomic launcher unlink failed");
-        (void)fprintf(stderr,
-                      "error: configuration/index cleanup completed before the failed commit; "
-                      "retry after reviewing the retained managed state\n");
-        return CLI_TRUE;
-    }
-    printf("Removed %s\n", activation->canonical_launcher_utf8);
-
-    /* The commit moved .cbm to a SHA/PID-qualified sibling before unlinking
-     * canonical. The permanent launcher derives that exact authenticated name
-     * and removes only that retired tree after both mapped images exit; a
-     * concurrent reinstall can safely create a new .cbm immediately. */
-    printf("Retired managed generation cleanup will complete after the launcher exits.\n");
-    return CLI_OK;
-}
-
-static int cli_windows_managed_uninstall(const char *home, bool dry_run) {
-    if (!g_windows_launcher_context.present || !g_windows_launcher_context.managed ||
-        !g_windows_launcher_context.private_activation ||
-        g_windows_launcher_context.action != CBM_WINDOWS_LAUNCHER_ACTION_UNINSTALL) {
-        return CLI_TRUE;
-    }
-    cbm_windows_current_v1_t current;
-    bool current_exists = false;
-    wchar_t launcher_backing[CBM_WINDOWS_LAUNCHER_PATH_CAP] = {0};
-    char validation_error[CLI_BUF_512] = {0};
-    if (!cli_windows_read_current(g_windows_launcher_context.canonical_launcher_path, &current,
-                                  &current_exists) ||
-        !current_exists ||
-        !cbm_windows_current_v1_supports_launcher_abi(&current, CBM_WINDOWS_LAUNCHER_ABI_CURRENT) ||
-        current.payload_size != g_windows_launcher_context.payload_size ||
-        strcmp(current.payload_sha256, g_windows_launcher_context.expected_payload_sha256) != 0 ||
-        !cbm_windows_managed_launcher_backing(g_windows_launcher_context.canonical_launcher_path,
-                                              launcher_backing, CBM_WINDOWS_LAUNCHER_PATH_CAP,
-                                              validation_error, sizeof(validation_error))) {
-        (void)fprintf(stderr,
-                      "error: authenticated managed launcher state changed before "
-                      "uninstall; no sessions were stopped%s%s\n",
-                      validation_error[0] ? ": " : "", validation_error[0] ? validation_error : "");
-        return CLI_TRUE;
-    }
-    wchar_t target_directory[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    if (!cli_windows_parent_path(g_windows_launcher_context.canonical_launcher_path,
-                                 target_directory, CBM_WINDOWS_LAUNCHER_PATH_CAP)) {
-        return CLI_TRUE;
-    }
-    if (!dry_run) {
-        char probe_error[CLI_BUF_512] = {0};
-        if (!cbm_windows_launcher_capability_probe(
-                target_directory, g_windows_launcher_context.canonical_launcher_path, probe_error,
-                sizeof(probe_error))) {
-            (void)fprintf(stderr,
-                          "error: managed launcher capability probe failed before "
-                          "stopping CBM sessions: %s\n",
-                          probe_error[0] ? probe_error
-                                         : "local fixed NTFS atomic removal is unavailable");
-            return CLI_TRUE;
-        }
-    }
-
-    bool delete_indexes = false;
-    int index_count = count_db_indexes(home);
-    if (index_count > 0) {
-        printf("\nFound %d index(es):\n", index_count);
-        cbm_list_indexes(home);
-        if (prompt_yn("Delete these indexes?")) {
-            delete_indexes = !dry_run;
-            if (dry_run) {
-                printf("(dry-run — indexes would be deleted)\n");
-            }
-        } else {
-            printf("Indexes kept.\n");
-        }
-    }
-    char *canonical_utf8 =
-        cli_windows_plain_utf8(g_windows_launcher_context.canonical_launcher_path);
-    if (!canonical_utf8) {
-        return CLI_TRUE;
-    }
-    g_agent_uninstall_errors = 0;
-    cli_windows_uninstall_activation_t activation = {
-        .home = home,
-        .canonical_launcher_utf8 = canonical_utf8,
-        .state = current,
-        .agents = cbm_detect_agents(home),
-        .delete_indexes = delete_indexes,
-        .dry_run = dry_run,
-    };
-    memcpy(activation.canonical_launcher, g_windows_launcher_context.canonical_launcher_path,
-           sizeof(activation.canonical_launcher));
-    memcpy(activation.launcher_backing, launcher_backing, sizeof(launcher_backing));
-    int result = dry_run
-                     ? cli_windows_managed_uninstall_activate(&activation)
-                     : cli_activation_guard(CBM_DAEMON_RUNTIME_ACTIVATION_UNINSTALL, NULL, NULL,
-                                            cli_windows_managed_uninstall_activate, &activation);
-    free(canonical_utf8);
-    return result;
-}
-#endif
 
 int cbm_cmd_uninstall(int argc, char **argv) {
+    /* `uninstall --help` used to UNINSTALL.
+     *
+     * The top-level dispatcher matches the subcommand at argv[1] and hands the
+     * rest here, so its own --help check never sees argv[2]. Nothing downstream
+     * looked either, and --help is the one flag a person types precisely
+     * BECAUSE they are not sure what a command does. It removed the binary and
+     * every agent configuration (#1038).
+     *
+     * Checked before parse_auto_answer so a `-y` sitting elsewhere on the line
+     * cannot auto-confirm the destruction we are trying to prevent. */
+    for (int i = 0; i < argc; i++) {
+        if (argv && argv[i] && (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0)) {
+            printf("Usage: codebase-memory-mcp uninstall [options]\n\n"
+                   "Removes the codebase-memory-mcp binary, its agent configurations and,\n"
+                   "with confirmation, its indexes. THIS IS DESTRUCTIVE.\n\n"
+                   "Options:\n"
+                   "  --dry-run        Show what would be removed, change nothing\n"
+                   "  --dir=PATH       Uninstall from a custom install directory\n"
+                   "  -y, --yes        Do not prompt for confirmation\n"
+                   "  -h, --help       Show this help and exit\n\n"
+                   "Run with --dry-run first if you are unsure.\n");
+            return CLI_OK;
+        }
+    }
     parse_auto_answer(argc, argv);
     bool dry_run = false;
+    /* An install into a custom --dir must be removable from that same dir:
+     * without this, anyone who installed outside ~/.local/bin has no supported
+     * uninstall path at all. Mirrors cbm_cmd_install's parsing. */
+    const char *requested_bin_dir = NULL;
     for (int i = 0; i < argc; i++) {
         /* The public command dispatcher passes option-only argv, while the
          * long-standing direct API/tests include the subcommand at argv[0]. */
@@ -12130,29 +11637,24 @@ int cbm_cmd_uninstall(int argc, char **argv) {
         }
         if (strcmp(argv[i], "--dry-run") == 0) {
             dry_run = true;
+        } else if (strncmp(argv[i], "--dir=", SLEN("--dir=")) == 0) {
+            requested_bin_dir = argv[i] + SLEN("--dir=");
+            if (!requested_bin_dir[0]) {
+                (void)fprintf(stderr, "error: --dir requires a non-empty path\n");
+                return CLI_TRUE;
+            }
+        } else if (strcmp(argv[i], "--dir") == 0) {
+            if (i + 1 >= argc || !argv[i + 1] || !argv[i + 1][0] || argv[i + 1][0] == '-') {
+                (void)fprintf(stderr, "error: --dir requires a non-empty path\n");
+                return CLI_TRUE;
+            }
+            requested_bin_dir = argv[++i];
         } else if (strcmp(argv[i], "-y") != 0 && strcmp(argv[i], "--yes") != 0 &&
                    strcmp(argv[i], "-n") != 0 && strcmp(argv[i], "--no") != 0) {
             (void)fprintf(stderr, "error: unknown uninstall option: %s\n", argv[i]);
             return CLI_TRUE;
         }
     }
-
-#ifdef _WIN32
-    /* A direct/package-manager payload is a one-shot portable instance. Fail
-     * before HOME/cache discovery, prompts, daemon IPC, or filesystem writes:
-     * only the permanent launcher may authorize managed removal. Test builds
-     * additionally compile the portable flow below, reachable solely through
-     * the activation test seam (loud), so the shared removal semantics stay
-     * unit-covered; release binaries contain only the managed path. */
-#ifdef CBM_CLI_ENABLE_TEST_API
-    if (!g_cli_activation_test_ops_set)
-#endif
-    {
-        if (!cli_windows_require_managed_mutation(CBM_WINDOWS_LAUNCHER_ACTION_UNINSTALL)) {
-            return CLI_TRUE;
-        }
-    }
-#endif
 
     const char *home = cbm_get_home_dir();
     if (!home) {
@@ -12162,25 +11664,6 @@ int cbm_cmd_uninstall(int argc, char **argv) {
 
     printf("codebase-memory-mcp uninstall\n\n");
 
-#ifdef _WIN32
-#ifdef CBM_CLI_ENABLE_TEST_API
-    if (g_cli_activation_test_ops_set) {
-        (void)fprintf(stderr,
-                      "*** cbm test seam: portable uninstall flow engaged; the managed Windows "
-                      "uninstall transaction is bypassed (test builds only) ***\n");
-    } else
-#endif
-    {
-        int windows_result = cli_windows_managed_uninstall(home, dry_run);
-        if (windows_result == CLI_OK) {
-            printf("\nUninstall complete. Please restart your coding-agent "
-                   "sessions to properly take this into account.\n");
-        }
-        return windows_result == CLI_OK ? CLI_OK : CLI_TRUE;
-    }
-#endif
-
-#if !defined(_WIN32) || defined(CBM_CLI_ENABLE_TEST_API)
     g_agent_uninstall_errors = 0;
     cbm_detected_agents_t agents = cbm_detect_agents(home);
 
@@ -12205,13 +11688,20 @@ int cbm_cmd_uninstall(int argc, char **argv) {
     char bin_path_storage[CLI_BUF_1K];
     const char *bin_path = bin_path_storage;
 #ifdef _WIN32
-    snprintf(bin_path_storage, sizeof(bin_path_storage), "%s/.local/bin/codebase-memory-mcp.exe",
-             home);
+    static const char kBinaryLeaf[] = "codebase-memory-mcp.exe";
 #else
-    snprintf(bin_path_storage, sizeof(bin_path_storage), "%s/.local/bin/codebase-memory-mcp", home);
+    static const char kBinaryLeaf[] = "codebase-memory-mcp";
 #endif
-    struct stat binary_status;
-    bool binary_exists = stat(bin_path, &binary_status) == 0;
+    int bin_path_length = requested_bin_dir ? snprintf(bin_path_storage, sizeof(bin_path_storage),
+                                                       "%s/%s", requested_bin_dir, kBinaryLeaf)
+                                            : snprintf(bin_path_storage, sizeof(bin_path_storage),
+                                                       "%s/.local/bin/%s", home, kBinaryLeaf);
+    if (bin_path_length <= 0 || (size_t)bin_path_length >= sizeof(bin_path_storage)) {
+        (void)fprintf(stderr, "error: uninstall target path is too long\n");
+        return CLI_TRUE;
+    }
+    cbm_path_info_t binary_status;
+    bool binary_exists = cbm_path_info_utf8(bin_path, &binary_status) == 0;
     cbm_activation_transaction_t *binary_transaction = NULL;
     if (!dry_run && binary_exists) {
         cbm_activation_transaction_status_t stage_status =
@@ -12252,7 +11742,6 @@ int cbm_cmd_uninstall(int argc, char **argv) {
         printf("(dry-run — no files were modified)\n");
     }
     return g_agent_uninstall_errors == 0 ? 0 : CLI_TRUE;
-#endif /* !defined(_WIN32) || defined(CBM_CLI_ENABLE_TEST_API) */
 }
 
 /* ── Subcommand: update ───────────────────────────────────────── */
@@ -12268,297 +11757,7 @@ typedef struct {
     bool delete_indexes;
 } extract_install_args_t;
 
-#ifdef _WIN32
-typedef struct {
-    const char *home;
-    const char *canonical_launcher_utf8;
-    wchar_t canonical_launcher[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    wchar_t previous_launcher_backing[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    cbm_windows_release_pair_t pair;
-    cbm_windows_current_v1_t state;
-    cbm_windows_current_v1_t previous_state;
-    cbm_windows_transition_plan_t transition_plan;
-    bool delete_indexes;
-} cli_windows_update_activation_t;
-
-static int cli_windows_managed_update_activate(void *opaque) {
-    cli_windows_update_activation_t *activation = opaque;
-    if (!activation || !activation->home || !activation->canonical_launcher_utf8 ||
-        !activation->pair.launcher || !activation->pair.payload) {
-        return CLI_TRUE;
-    }
-    cbm_windows_current_v1_t observed;
-    bool observed_exists = false;
-    wchar_t observed_backing[CBM_WINDOWS_LAUNCHER_PATH_CAP] = {0};
-    char error[CLI_BUF_512] = {0};
-    if (!cli_windows_read_current(activation->canonical_launcher, &observed, &observed_exists) ||
-        !observed_exists || !cli_windows_current_equal(&observed, &activation->previous_state) ||
-        !cbm_windows_managed_launcher_backing(activation->canonical_launcher, observed_backing,
-                                              CBM_WINDOWS_LAUNCHER_PATH_CAP, error,
-                                              sizeof(error)) ||
-        _wcsicmp(observed_backing, activation->previous_launcher_backing) != 0 ||
-        activation->transition_plan == CBM_WINDOWS_TRANSITION_INCOMPATIBLE) {
-        (void)fprintf(stderr, "error: managed Windows state changed before update "
-                              "activation; no generation was published\n");
-        return CLI_TRUE;
-    }
-    wchar_t generation_launcher[CBM_WINDOWS_LAUNCHER_PATH_CAP] = {0};
-    bool generation_created = false;
-    bool generation_ready = cli_windows_publish_generation_bytes(
-        activation->canonical_launcher, &activation->state, activation->pair.launcher,
-        (size_t)activation->pair.launcher_len, activation->pair.payload,
-        (size_t)activation->pair.payload_len, &generation_created);
-    generation_ready =
-        generation_ready && cbm_windows_generation_launcher_path(
-                                activation->canonical_launcher, activation->state.payload_sha256,
-                                generation_launcher, CBM_WINDOWS_LAUNCHER_PATH_CAP);
-    bool launcher_committed = false;
-    bool current_committed = false;
-    if (generation_ready && activation->transition_plan == CBM_WINDOWS_TRANSITION_CURRENT_FIRST) {
-        current_committed = cbm_windows_current_v1_write_atomic(
-            activation->canonical_launcher, &activation->state, error, sizeof(error));
-        launcher_committed = current_committed && cbm_windows_launcher_replace_atomic(
-                                                      activation->canonical_launcher,
-                                                      generation_launcher, error, sizeof(error));
-    } else if (generation_ready) {
-        launcher_committed = cbm_windows_launcher_replace_atomic(
-            activation->canonical_launcher, generation_launcher, error, sizeof(error));
-        current_committed = launcher_committed && cbm_windows_current_v1_write_atomic(
-                                                      activation->canonical_launcher,
-                                                      &activation->state, error, sizeof(error));
-    }
-    if (!generation_ready || !launcher_committed || !current_committed) {
-        char restore_error[CLI_BUF_512] = {0};
-        if (!cli_windows_restore_managed_pair(
-                activation->canonical_launcher, activation->previous_launcher_backing, true,
-                &activation->previous_state, true, restore_error, sizeof(restore_error))) {
-            (void)fprintf(stderr,
-                          "error: managed Windows update could not restore the previous "
-                          "launcher/current pair: %s\n",
-                          restore_error[0] ? restore_error : "atomic restoration failed");
-        }
-        char rollback_error[CLI_BUF_256] = {0};
-        if (!cbm_windows_generation_rollback_if_unreferenced(
-                activation->canonical_launcher, activation->state.payload_sha256,
-                generation_created, rollback_error, sizeof(rollback_error))) {
-            (void)fprintf(stderr,
-                          "error: managed Windows update generation rollback failed: "
-                          "%s\n",
-                          rollback_error[0] ? rollback_error
-                                            : "generation remains for safe recovery");
-        }
-        (void)fprintf(stderr,
-                      "error: managed Windows update commit failed: %s. The "
-                      "compatible launcher/current pair remains runnable; retry "
-                      "update after reviewing activation-events.ndjson.\n",
-                      error[0] ? error : "generation/launcher/current publish failed");
-        return CLI_TRUE;
-    }
-
-    int activation_status = CLI_OK;
-    size_t generations_removed = 0U;
-    char prune_error[CLI_BUF_256] = {0};
-    if (!cbm_windows_generations_prune(activation->canonical_launcher, &generations_removed,
-                                       prune_error, sizeof(prune_error))) {
-        (void)fprintf(stderr,
-                      "error: managed Windows update committed, but old generation "
-                      "pruning was incomplete: %s\n",
-                      prune_error[0] ? prune_error : "unsafe generation entry");
-        activation_status = CLI_ACTIVATION_PARTIAL;
-    }
-    printf("Refreshing agent configurations...\n");
-    if (cbm_install_agent_configs(activation->home, activation->canonical_launcher_utf8, true,
-                                  false) != CLI_OK) {
-        (void)fprintf(stderr, "error: update was published, but one or more agent "
-                              "configuration refreshes failed\n");
-        return CLI_ACTIVATION_PARTIAL;
-    }
-    if (activation->delete_indexes) {
-        int expected = count_db_indexes(activation->home);
-        int removed = cbm_remove_indexes(activation->home);
-        printf("Removed %d index(es).\n\n", removed);
-        if (removed != expected) {
-            (void)fprintf(stderr, "error: only %d of %d indexes could be removed\n", removed,
-                          expected);
-            return CLI_ACTIVATION_PARTIAL;
-        }
-    }
-    return activation_status;
-}
-
-static int cli_windows_extract_and_activate_update(const char *archive_path, const char *home,
-                                                   bool delete_indexes) {
-    FILE *archive = cbm_fopen(archive_path, "rb");
-    if (!archive || fseek(archive, 0, SEEK_END) != 0) {
-        if (archive) {
-            (void)fclose(archive);
-        }
-        (void)cbm_unlink(archive_path);
-        return CLI_TRUE;
-    }
-    long length = ftell(archive);
-    if (length <= 0 || length > INT_MAX || fseek(archive, 0, SEEK_SET) != 0) {
-        (void)fclose(archive);
-        (void)cbm_unlink(archive_path);
-        return CLI_TRUE;
-    }
-    unsigned char *bytes = malloc((size_t)length);
-    size_t received = bytes ? fread(bytes, 1, (size_t)length, archive) : 0;
-    int closed = fclose(archive);
-    (void)cbm_unlink(archive_path);
-    cbm_windows_release_pair_t pair;
-    bool extracted = bytes && received == (size_t)length && closed == 0 &&
-                     cbm_extract_windows_release_pair_from_zip(bytes, (int)length, &pair);
-    free(bytes);
-    if (!extracted || pair.launcher_len < 2 || pair.payload_len < 2 || pair.launcher[0] != 'M' ||
-        pair.launcher[1] != 'Z' || pair.payload[0] != 'M' || pair.payload[1] != 'Z') {
-        if (extracted) {
-            cbm_windows_release_pair_free(&pair);
-        }
-        (void)fprintf(stderr, "error: Windows release must contain exactly one verified root "
-                              "launcher and payload executable\n");
-        return CLI_TRUE;
-    }
-
-    char payload_sha[CBM_SHA256_HEX_LEN + 1];
-    cbm_sha256_hex(pair.payload, (size_t)pair.payload_len, payload_sha);
-
-    cbm_windows_current_v1_t current;
-    memset(&current, 0, sizeof(current));
-    bool current_exists = false;
-    wchar_t previous_launcher_backing[CBM_WINDOWS_LAUNCHER_PATH_CAP] = {0};
-    char backing_error[CLI_BUF_512] = {0};
-    bool current_compatible =
-        cli_windows_read_current(g_windows_launcher_context.canonical_launcher_path, &current,
-                                 &current_exists) &&
-        current_exists &&
-        cbm_windows_current_v1_supports_launcher_abi(&current, CBM_WINDOWS_LAUNCHER_ABI_CURRENT) &&
-        cbm_windows_managed_launcher_backing(
-            g_windows_launcher_context.canonical_launcher_path, previous_launcher_backing,
-            CBM_WINDOWS_LAUNCHER_PATH_CAP, backing_error, sizeof(backing_error));
-    char *canonical_utf8 =
-        current_compatible
-            ? cli_windows_plain_utf8(g_windows_launcher_context.canonical_launcher_path)
-            : NULL;
-    if (!canonical_utf8) {
-        cbm_windows_release_pair_free(&pair);
-        (void)fprintf(stderr,
-                      "error: old/new managed launcher ABI or two-link backing check "
-                      "failed before update activation%s%s\n",
-                      backing_error[0] ? ": " : "", backing_error[0] ? backing_error : "");
-        return CLI_TRUE;
-    }
-    wchar_t prepared_launcher[CBM_WINDOWS_LAUNCHER_PATH_CAP] = {0};
-    wchar_t prepared_payload[CBM_WINDOWS_LAUNCHER_PATH_CAP] = {0};
-    wchar_t target_directory[CBM_WINDOWS_LAUNCHER_PATH_CAP] = {0};
-    char prepared_directory[CLI_BUF_1K] = {0};
-    char candidate_error[CLI_BUF_512] = {0};
-    bool pair_prepared = cli_windows_prepare_update_pair(&pair, payload_sha, prepared_launcher,
-                                                         prepared_payload, prepared_directory);
-    cbm_windows_release_descriptor_v1_t descriptor;
-    memset(&descriptor, 0, sizeof(descriptor));
-    bool descriptor_ready =
-        pair_prepared &&
-        cbm_windows_release_descriptor_probe(prepared_launcher, &descriptor, candidate_error,
-                                             sizeof(candidate_error)) &&
-        descriptor.payload_size == (uint64_t)pair.payload_len &&
-        strcmp(descriptor.payload_sha256, payload_sha) == 0;
-    cbm_windows_transition_plan_t transition_plan =
-        descriptor_ready ? cbm_windows_transition_plan(&current, &descriptor)
-                         : CBM_WINDOWS_TRANSITION_INCOMPATIBLE;
-    bool candidate_supported =
-        descriptor_ready && transition_plan != CBM_WINDOWS_TRANSITION_INCOMPATIBLE &&
-        cli_windows_parent_path(g_windows_launcher_context.canonical_launcher_path,
-                                target_directory, CBM_WINDOWS_LAUNCHER_PATH_CAP) &&
-        cbm_windows_launcher_capability_probe(target_directory, prepared_launcher, candidate_error,
-                                              sizeof(candidate_error));
-    if (pair_prepared) {
-        cli_windows_cleanup_install_pair(prepared_launcher, prepared_payload, prepared_directory);
-    }
-    if (!candidate_supported) {
-        cbm_windows_release_pair_free(&pair);
-        free(canonical_utf8);
-        (void)fprintf(stderr,
-                      "error: downloaded Windows launcher candidate is not runnable, "
-                      "has an incompatible launcher/payload ABI descriptor, or lacks "
-                      "required mapped-image capability: %s. Active CBM sessions were "
-                      "not stopped.\n",
-                      candidate_error[0] ? candidate_error
-                      : transition_plan == CBM_WINDOWS_TRANSITION_INCOMPATIBLE
-                          ? "an intermediate launcher ABI bridge is required"
-                          : "private launcher/payload validation failed");
-        return CLI_TRUE;
-    }
-    cbm_windows_current_v1_t next = {
-        .launcher_abi_min = descriptor.payload_launcher_abi_min,
-        .launcher_abi_max = descriptor.payload_launcher_abi_max,
-        .payload_size = descriptor.payload_size,
-    };
-    (void)snprintf(next.payload_sha256, sizeof(next.payload_sha256), "%s",
-                   descriptor.payload_sha256);
-    cli_windows_update_activation_t activation = {
-        .home = home,
-        .canonical_launcher_utf8 = canonical_utf8,
-        .pair = pair,
-        .state = next,
-        .previous_state = current,
-        .transition_plan = transition_plan,
-        .delete_indexes = delete_indexes,
-    };
-    memcpy(activation.canonical_launcher, g_windows_launcher_context.canonical_launcher_path,
-           sizeof(activation.canonical_launcher));
-    memcpy(activation.previous_launcher_backing, previous_launcher_backing,
-           sizeof(previous_launcher_backing));
-    int result =
-        cli_activation_guard(CBM_DAEMON_RUNTIME_ACTIVATION_UPDATE, NULL, next.payload_sha256,
-                             cli_windows_managed_update_activate, &activation);
-    cbm_windows_release_pair_free(&activation.pair);
-    free(canonical_utf8);
-    return result == CLI_OK ? CLI_OK : CLI_TRUE;
-}
-
-static bool cli_windows_managed_update_preflight(bool probe_capability) {
-    cbm_windows_current_v1_t current;
-    bool current_exists = false;
-    wchar_t launcher_backing[CBM_WINDOWS_LAUNCHER_PATH_CAP] = {0};
-    char error[CLI_BUF_512] = {0};
-    if (!g_windows_launcher_context.present || !g_windows_launcher_context.managed ||
-        !g_windows_launcher_context.private_activation ||
-        g_windows_launcher_context.action != CBM_WINDOWS_LAUNCHER_ACTION_UPDATE ||
-        !cli_windows_read_current(g_windows_launcher_context.canonical_launcher_path, &current,
-                                  &current_exists) ||
-        !current_exists || current.payload_size != g_windows_launcher_context.payload_size ||
-        strcmp(current.payload_sha256, g_windows_launcher_context.expected_payload_sha256) != 0 ||
-        !cbm_windows_current_v1_supports_launcher_abi(&current, CBM_WINDOWS_LAUNCHER_ABI_CURRENT) ||
-        !cbm_windows_managed_launcher_backing(g_windows_launcher_context.canonical_launcher_path,
-                                              launcher_backing, CBM_WINDOWS_LAUNCHER_PATH_CAP,
-                                              error, sizeof(error))) {
-        (void)fprintf(stderr,
-                      "error: authenticated managed launcher state changed before "
-                      "update; no network or daemon operation was started%s%s\n",
-                      error[0] ? ": " : "", error[0] ? error : "");
-        return false;
-    }
-    if (!probe_capability) {
-        return true;
-    }
-    wchar_t directory[CBM_WINDOWS_LAUNCHER_PATH_CAP];
-    error[0] = '\0';
-    if (!cli_windows_parent_path(g_windows_launcher_context.canonical_launcher_path, directory,
-                                 CBM_WINDOWS_LAUNCHER_PATH_CAP) ||
-        !cbm_windows_launcher_capability_probe(
-            directory, g_windows_launcher_context.canonical_launcher_path, error, sizeof(error))) {
-        (void)fprintf(stderr,
-                      "error: managed launcher capability probe failed before update: "
-                      "%s\n",
-                      error[0] ? error : "local fixed NTFS atomic replacement is unavailable");
-        return false;
-    }
-    return true;
-}
-#endif
-
-#ifndef _WIN32
+#ifdef CBM_CLI_ENABLE_TEST_API
 typedef struct {
     const char *bin_dest;
     const char *home;
@@ -12572,6 +11771,9 @@ static int cli_update_activate_binary(void *opaque) {
     if (!activation || !activation->bin_dest || !activation->binary_transaction) {
         return CLI_TRUE;
     }
+    char previous_managed_binary[CLI_BUF_1K] = {0};
+    bool previous_managed_binary_exact = cbm_detect_self_path(
+        previous_managed_binary, sizeof(previous_managed_binary), activation->home);
     if (cli_activation_transaction_commit_validated(activation->binary_transaction,
                                                     &activation->binary_validator,
                                                     CLI_OCTAL_PERM) != CLI_OK) {
@@ -12584,7 +11786,10 @@ static int cli_update_activate_binary(void *opaque) {
      * exact-build activation window. Otherwise another CBM process can start
      * after the binary swap but before its MCP/hook entries are refreshed. */
     printf("Refreshing agent configurations...\n");
-    if (cbm_install_agent_configs(activation->home, activation->bin_dest, true, false) != CLI_OK) {
+    if (cbm_install_agent_configs_with_previous(
+            activation->home, activation->bin_dest,
+            previous_managed_binary_exact ? previous_managed_binary : NULL, true,
+            false) != CLI_OK) {
         cli_activation_transaction_finalize_committed_or_fail_stop(
             &activation->binary_transaction, "update_transaction_config_failure_finalize");
         (void)fprintf(stderr, "error: one or more agent configurations failed; the "
@@ -12608,13 +11813,8 @@ static int cli_update_activate_binary(void *opaque) {
                                                                "update_transaction_finalize");
     return CLI_OK;
 }
-#endif
 
 static int extract_and_install_binary(extract_install_args_t args) {
-#ifdef _WIN32
-    return cli_windows_extract_and_activate_update(args.tmp_archive, args.home,
-                                                   args.delete_indexes);
-#else
     const char *tmp_archive = args.tmp_archive;
     const char *ext = args.ext;
     const char *bin_dest = args.bin_dest;
@@ -12759,12 +11959,18 @@ static int extract_and_install_binary(extract_install_args_t args) {
         (void)cli_activation_transaction_abort(&activation.binary_transaction);
     }
     return activation_rc == CLI_OK ? CLI_OK : CLI_TRUE;
-#endif
 }
 
+#endif /* CBM_CLI_ENABLE_TEST_API */
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+/* Update-only helpers. The release build hands updating to the install
+ * script, so none of this ships: no release URL construction, no archive
+ * download, no extract-and-exec. Retained for the C suite, which still
+ * covers the flow through the activation test seam. */
 /* Build the download URL for the update command. */
 static void build_update_url(char *url, int url_sz, const char *os, const char *arch,
-                             const char *ext, bool want_ui) {
+                             const char *ext) {
     char base_url_buf[CLI_BUF_512];
     const char *base_url =
         cbm_safe_getenv("CBM_DOWNLOAD_URL", base_url_buf, sizeof(base_url_buf), NULL);
@@ -12776,8 +11982,7 @@ static void build_update_url(char *url, int url_sz, const char *os, const char *
      * have no such variant. Keep in sync with install.sh / install.js / pypi
      * _cli.py. */
     const char *portable = (strcmp(os, "linux") == 0) ? "-portable" : "";
-    snprintf(url, url_sz, "%s/codebase-memory-mcp-%s%s-%s%s.%s", base_url, want_ui ? "ui-" : "", os,
-             arch, portable, ext);
+    snprintf(url, url_sz, "%s/codebase-memory-mcp-%s-%s%s.%s", base_url, os, arch, portable, ext);
 }
 
 /* Confirm index deletion before network I/O, but defer the deletion itself to
@@ -12810,8 +12015,8 @@ static int update_prepare_clear_indexes(const char *home, bool dry_run, bool *de
 
 /* Download and verify before disruption, then activate under daemon locks. */
 static int download_verify_install(const char *url, const char *ext, const char *os,
-                                   const char *arch, bool want_ui, const char *bin_dest,
-                                   const char *home, bool delete_indexes) {
+                                   const char *arch, const char *bin_dest, const char *home,
+                                   bool delete_indexes) {
     char tmp_archive[CLI_BUF_256];
     int archive_path_length =
         snprintf(tmp_archive, sizeof(tmp_archive), "%s/cbm-update-XXXXXX", cbm_tmpdir());
@@ -12842,8 +12047,8 @@ static int download_verify_install(const char *url, const char *ext, const char 
     char archive_name[CLI_BUF_256];
     /* Must match build_update_url: linux uses the static "-portable" asset. */
     const char *portable = (strcmp(os, "linux") == 0) ? "-portable" : "";
-    snprintf(archive_name, sizeof(archive_name), "codebase-memory-mcp-%s%s-%s%s.%s",
-             want_ui ? "ui-" : "", os, arch, portable, ext);
+    snprintf(archive_name, sizeof(archive_name), "codebase-memory-mcp-%s-%s%s.%s", os, arch,
+             portable, ext);
     /* Fail closed: install only a positively-verified download. A mismatch,
      * a missing checksum entry, or an unavailable hash tool (crc != 0) all
      * abort rather than install an unverified binary. */
@@ -12864,34 +12069,6 @@ static int download_verify_install(const char *url, const char *ext, const char 
         return CLI_TRUE;
     }
     return 0;
-}
-
-/* Select update variant. Returns 0=standard, 1=ui, -1=error. */
-static int select_update_variant(int variant_flag) {
-    if (variant_flag == VARIANT_A) {
-        return 0;
-    }
-    if (variant_flag == VARIANT_B) {
-        return CLI_TRUE;
-    }
-#ifndef _WIN32
-    if (!isatty(fileno(stdin))) {
-        (void)fprintf(stderr, "error: variant selection requires a terminal. "
-                              "Use --standard or --ui flag.\n");
-        return CLI_ERR;
-    }
-#endif
-    printf("Which binary variant do you want?\n");
-    printf("  1) standard  — MCP server only\n");
-    printf("  2) ui        — MCP server + embedded graph visualization\n");
-    printf("Choose (1/2): ");
-    (void)fflush(stdout);
-    char choice[CLI_BUF_16];
-    if (!fgets(choice, sizeof(choice), stdin)) {
-        (void)fprintf(stderr, "error: failed to read input\n");
-        return CLI_ERR;
-    }
-    return (choice[0] == '2') ? CLI_TRUE : 0;
 }
 
 /* Case-insensitive prefix match (portable — no strncasecmp dependency). */
@@ -12968,59 +12145,195 @@ static bool check_already_latest(void) {
     return false;
 }
 
+#endif /* CBM_CLI_ENABLE_TEST_API */
+
+/* Is the installer script actually present beside the binary? (#1632)
+ *
+ * `update` hands off to install.sh / install.ps1 and prints the command to run.
+ * It derived that path from the binary's own location, which is not the same
+ * question: the installer is placed beside the binary by install.sh, but a
+ * binary moved, packaged, or built from source has no installer next to it, and
+ * we still printed the path. The user's session then ended on a command that
+ * cannot run.
+ *
+ * Checked with cbm_path_info_utf8 so a non-ASCII install path resolves on
+ * Windows. A symlink counts: it is reported rather than followed, and the shell
+ * will run it perfectly well. */
+bool cbm_cli_installer_beside_binary(const char *dir) {
+    if (!dir || !dir[0]) {
+        return false;
+    }
+    char script[CLI_BUF_1K];
+#ifdef _WIN32
+    const char *name = "install.ps1";
+#else
+    const char *name = "install.sh";
+#endif
+    int written = snprintf(script, sizeof(script), "%s/%s", dir, name);
+    if (written <= 0 || (size_t)written >= sizeof(script)) {
+        return false;
+    }
+    cbm_path_info_t info;
+    return cbm_path_info_utf8(script, &info) == 0 && !info.is_directory;
+}
+
 int cbm_cmd_update(int argc, char **argv) {
     parse_auto_answer(argc, argv);
 
     bool dry_run = false;
     bool force = false;
-    int variant_flag = 0; /* 0 = ask, 1 = standard, 2 = ui */
+    bool legacy_variant_flag = false;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--dry-run") == 0) {
             dry_run = true;
-        } else if (strcmp(argv[i], "--standard") == 0) {
-            variant_flag = VARIANT_A;
-        } else if (strcmp(argv[i], "--ui") == 0) {
-            variant_flag = VARIANT_B;
         } else if (strcmp(argv[i], "--force") == 0) {
             force = true;
+        } else if (strcmp(argv[i], "--ui") == 0 || strcmp(argv[i], "--standard") == 0) {
+            /* v0.10.2 deleted the ui/standard chooser and, with it, these flags —
+             * which turned `update --ui` from a working command into a hard
+             * error for everyone who had it in a script, an alias, or muscle
+             * memory (#1544). Removing a CHOICE is fine; removing the WORDS
+             * people type is a break we owe them nothing for. Accept both,
+             * ignore them, and say once why they no longer mean anything. */
+            legacy_variant_flag = true;
         } else if (strcmp(argv[i], "-y") != 0 && strcmp(argv[i], "--yes") != 0 &&
                    strcmp(argv[i], "-n") != 0 && strcmp(argv[i], "--no") != 0) {
             (void)fprintf(stderr, "error: unknown update option: %s\n", argv[i]);
             return CLI_TRUE;
         }
     }
+    if (legacy_variant_flag) {
+        (void)fprintf(stderr, "note: --ui/--standard are accepted but no longer do anything; since "
+                              "v0.10.0 there is one build per platform and it always includes the "
+                              "graph UI.\n");
+    }
 
-#ifdef _WIN32
-    /* Refuse portable self-update before HOME/cache discovery, the release
-     * version check, network I/O, prompts, or cohort construction. In test
-     * builds the activation test seam routes past both managed gates (loud)
-     * so the shared update semantics stay unit-covered; release binaries
-     * always enforce them. */
-    bool update_seam_portable = false;
+    /* #1566: we cannot update a binary a package manager owns, and pretending
+     * otherwise is the dishonest-success pattern this project keeps fixing:
+     * reporting that an update ran while changing nothing leaves the user
+     * convinced they are current. Refuse, and name the command that WILL work. */
+    {
+        char self_path[CLI_BUF_1K] = {0};
+        const char *home = cbm_get_home_dir();
+        bool self_exact = home && cbm_detect_self_path(self_path, sizeof(self_path), home);
+        char managed_dir[CLI_BUF_1K] = {0};
+        if (self_exact && home) {
+            snprintf(managed_dir, sizeof(managed_dir), "%s/.local/bin", home);
+        }
+        if (self_exact && cli_binary_is_externally_managed(self_path, true, managed_dir)) {
+            const char *manager = cli_external_manager_name(self_path);
+            (void)fprintf(stderr,
+                          "error: this binary is managed by %s, so `update` cannot replace it:\n"
+                          "  %s\n",
+                          manager ? manager : "another installer", self_path);
+            if (manager && strcmp(manager, "mise") == 0) {
+                (void)fprintf(stderr, "  update it with: mise upgrade codebase-memory-mcp\n");
+            } else if (manager && strcmp(manager, "Homebrew") == 0) {
+                (void)fprintf(stderr, "  update it with: brew upgrade codebase-memory-mcp\n");
+            } else {
+                (void)fprintf(stderr, "  update it through whichever tool installed it.\n");
+            }
+            (void)fprintf(stderr, "  to refresh only the agent configurations, run: "
+                                  "codebase-memory-mcp install --skip-binary\n");
+            return CLI_TRUE;
+        }
+    }
+
+    /* Updates run from the install script, not from this process — on every
+     * platform.
+     *
+     * Windows forced the split first: a running .exe cannot replace itself, so
+     * an in-process updater needed a second resident binary to swap the first
+     * one out, and that launcher stub was exactly the shape Defender's ML
+     * scores as a dropper.
+     *
+     * The rest followed for the same reason rather than a different one. An
+     * in-process updater is, structurally, a downloader: it fetches a remote
+     * archive, extracts it, marks the result executable and runs it. That is
+     * the behaviour Microsoft's Wacatac family describes almost verbatim, and
+     * carrying it in the product binary put download/extract/chmod/exec in
+     * every shipped artifact for a command most users run a handful of times.
+     *
+     * The install script already does all of it, is idempotent -- so re-running
+     * it IS the update -- and runs while cbm is NOT running. Print the exact
+     * command instead of feigning self-update. */
+#ifndef CBM_CLI_ENABLE_TEST_API
+    /* A release build has nothing to do but hand off. The flags are still
+     * parsed and validated above, so `update --dry-run` and friends keep
+     * rejecting typos instead of silently accepting them. */
+    (void)dry_run;
+    (void)force;
+#endif
 #ifdef CBM_CLI_ENABLE_TEST_API
-    update_seam_portable = g_cli_activation_test_ops_set;
-    if (update_seam_portable) {
-        (void)fprintf(stderr, "*** cbm test seam: portable update flow engaged; the managed "
-                              "Windows update gates are bypassed (test builds only) ***\n");
-    }
+    if (g_cli_activation_test_ops_set) {
+        (void)fprintf(stderr, "*** cbm test seam: portable update flow engaged; the "
+                              "script-update handoff is bypassed (test builds only) ***\n");
+    } else
 #endif
-    if (!update_seam_portable &&
-        !cli_windows_require_managed_mutation(CBM_WINDOWS_LAUNCHER_ACTION_UPDATE)) {
-        return CLI_TRUE;
-    }
+    {
+        char self_dir[CLI_BUF_1K] = {0};
+        bool have_dir = false;
+        /* cbm_detect_self_path resolves wide on Windows (non-ASCII install
+         * paths survive) and normalizes to forward separators on every
+         * platform, so one branch serves both. */
+        char *last_sep = cbm_detect_self_path(self_dir, sizeof(self_dir), cbm_get_home_dir())
+                             ? strrchr(self_dir, '/')
+                             : NULL;
+        if (last_sep) {
+            *last_sep = '\0';
+            have_dir = true;
+        }
+        printf("codebase-memory-mcp update (current: %s)\n\n", CBM_VERSION);
+#ifdef _WIN32
+        /* The printed command deliberately carries NO execution-policy override.
+         * A policy-bypass invocation is one of the most heavily weighted
+         * malicious-script patterns there is, and emitting it as a literal put
+         * that signature inside every Windows artifact we distribute — to save
+         * the user one documented step. Pointing at Unblock-File reaches the
+         * same outcome and leaves the policy decision with them. README's
+         * Windows install section carries the override for the
+         * restricted-policy case: documentation is the right place to hand out
+         * that incantation, a shipped binary is not. */
+        printf("The update runs from install.ps1, not from this process. Close any\n"
+               "running sessions, then run\n\n");
+        if (have_dir) {
+            printf("  powershell -File \"%s/install.ps1\"\n\n", self_dir);
+        } else {
+            printf("  powershell -File install.ps1\n"
+                   "  (ships in the release archive, and is placed beside the\n"
+                   "  binary on install)\n\n");
+        }
+        printf("It downloads the latest release, verifies its checksum, and replaces\n"
+               "this binary in place. If PowerShell refuses to run the script, it is\n"
+               "usually because the file arrived from the internet: run\n"
+               "'Unblock-File install.ps1' first. If your execution policy still\n"
+               "blocks it, the README's Windows install section lists the options.\n");
+#else
+        printf("The update runs from install.sh, not from this process. Run\n\n");
+        if (have_dir) {
+            printf("  bash \"%s/install.sh\"\n\n", self_dir);
+        } else {
+            printf("  install.sh (ships in the release archive, and is placed\n"
+                   "  beside the binary on install)\n\n");
+        }
+        printf("It downloads the latest release, verifies its checksum, and replaces\n"
+               "this binary in place. install.sh is idempotent, so re-running it IS\n"
+               "the update. One build per platform — the graph UI is always\n"
+               "included.\n");
 #endif
+        return 0;
+    }
 
+    /* Everything below is the in-process updater and is excluded from release
+     * builds entirely -- that exclusion, not dead-code elimination, is what
+     * keeps download/extract/chmod/exec and the release URLs out of the
+     * shipped artifact. */
+#ifdef CBM_CLI_ENABLE_TEST_API
     const char *home = cbm_get_home_dir();
     if (!home) {
         (void)fprintf(stderr, "error: HOME not set (use USERPROFILE on Windows)\n");
         return CLI_TRUE;
     }
-
-#ifdef _WIN32
-    if (!update_seam_portable && !cli_windows_managed_update_preflight(!dry_run)) {
-        return CLI_TRUE;
-    }
-#endif
 
     printf("codebase-memory-mcp update (current: %s)\n\n", CBM_VERSION);
 
@@ -13035,43 +12348,29 @@ int cbm_cmd_update(int argc, char **argv) {
         return CLI_TRUE;
     }
 
-    /* Step 2: Determine variant */
-    int want_ui_rc = select_update_variant(variant_flag);
-    if (want_ui_rc < 0) {
-        return CLI_TRUE;
-    }
-    bool want_ui = (want_ui_rc == CLI_TRUE);
-    const char *variant = want_ui ? "ui-" : "";
-    const char *variant_label = want_ui ? "ui" : "standard";
-
     const char *os = detect_os();
     const char *arch = detect_arch();
     const char *ext = strcmp(os, "windows") == 0 ? "zip" : "tar.gz";
 
     char url[CLI_BUF_512];
-    build_update_url(url, sizeof(url), os, arch, ext, want_ui);
+    build_update_url(url, sizeof(url), os, arch, ext);
 
     if (dry_run) {
-        printf("\nWould download %s binary for %s/%s ...\n", variant_label, os, arch);
+        printf("\nWould download the binary for %s/%s ...\n", os, arch);
     } else {
-        printf("\nDownloading %s binary for %s/%s ...\n", variant_label, os, arch);
+        printf("\nDownloading the binary for %s/%s ...\n", os, arch);
     }
     printf("  %s\n", url);
 
     if (dry_run) {
         printf("\n(dry-run — skipping download, extraction, and binary replacement)\n");
 #ifdef _WIN32
-        char *dry_run_target =
-            cli_windows_plain_utf8(g_windows_launcher_context.canonical_launcher_path);
-        printf("  target: %s\n", dry_run_target ? dry_run_target : "(managed launcher)");
-        free(dry_run_target);
+        printf("  target: %s/.local/bin/codebase-memory-mcp.exe\n", home);
 #else
         printf("  target: %s/.local/bin/codebase-memory-mcp\n", home);
 #endif
-        printf("  variant: %s\n", variant_label);
         printf("  os/arch: %s/%s\n", os, arch);
         printf("\nUpdate dry-run complete.\n");
-        (void)variant;
         return 0;
     }
 
@@ -13079,26 +12378,20 @@ int cbm_cmd_update(int argc, char **argv) {
     char bin_dest_storage[CLI_BUF_1K];
     const char *bin_dest = bin_dest_storage;
 #ifdef _WIN32
-    char *managed_target = cbm_wide_to_utf8(g_windows_launcher_context.canonical_launcher_path);
-    if (!managed_target) {
-        return CLI_TRUE;
-    }
-    bin_dest = managed_target;
+    snprintf(bin_dest_storage, sizeof(bin_dest_storage), "%s/.local/bin/codebase-memory-mcp.exe",
+             home);
 #else
     snprintf(bin_dest_storage, sizeof(bin_dest_storage), "%s/.local/bin/codebase-memory-mcp", home);
+#endif
     char bin_dir[CLI_BUF_1K];
     snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", home);
     if (!cbm_mkdir_p(bin_dir, CLI_OCTAL_PERM)) {
         (void)fprintf(stderr, "error: cannot prepare update directory %s\n", bin_dir);
         return CLI_TRUE;
     }
-#endif
 
-    int rc = download_verify_install(url, ext, os, arch, want_ui, bin_dest, home, delete_indexes);
+    int rc = download_verify_install(url, ext, os, arch, bin_dest, home, delete_indexes);
     if (rc != 0) {
-#ifdef _WIN32
-        free(managed_target);
-#endif
         return CLI_TRUE;
     }
 
@@ -13114,11 +12407,8 @@ int cbm_cmd_update(int argc, char **argv) {
     printf("automatically when you next use the MCP server.\n");
     printf("\nUpdate complete. Please restart your coding-agent sessions to "
            "properly take this into account.\n");
-    (void)variant;
-#ifdef _WIN32
-    free(managed_target);
-#endif
     return 0;
+#endif /* CBM_CLI_ENABLE_TEST_API */
 }
 
 /* ── CLI tool arguments (flags / --args-file / --help) ────────────── */
@@ -13272,6 +12562,49 @@ static void cli_add_typed(yyjson_mut_doc *out, yyjson_mut_val *obj, const char *
         vv = yyjson_mut_strcpy(out, have_value ? value : "");
     }
     yyjson_mut_obj_add(obj, yyjson_mut_strcpy(out, key), vv);
+}
+
+bool cbm_cli_args_from_stdin_allowed(const char *tool_name, bool stdin_is_tty) {
+    /* An interactive run has nothing piped to read: consulting the terminal
+     * would just sit waiting for the user to type JSON. Unchanged by #1359 —
+     * this is why the hang was only ever reachable from automation. */
+    if (stdin_is_tty) {
+        return false;
+    }
+
+    /* WHY the schema gate (#1359): a non-interactive stdin used to be accepted
+     * as piped arguments unconditionally, and cli_slurp_stream reads to EOF. An
+     * ordinary non-interactive caller never sends that EOF — Node's
+     * child_process.spawn defaults to stdio:['pipe','pipe','pipe'] and the
+     * parent must call child.stdin.end() explicitly, which almost nobody does
+     * for a command they are not writing to. fd 0 then stays open with no
+     * writer and the read never returns; the reporter's shell script was still
+     * parked in fread(0) fourteen minutes later. For a tool whose input_schema
+     * declares no properties (list_projects) stdin cannot carry anything the
+     * tool would accept, so that read is pure deadlock with nothing to gain:
+     * never start it, and let the caller fall through to `{}` exactly as an
+     * interactive run already did. Tools that DO declare properties keep the
+     * documented `echo '<json>' | cli <tool>` channel untouched. */
+    const char *schema_str = cbm_mcp_tool_input_schema(tool_name);
+    if (!schema_str) {
+        /* Unknown tool: dispatch rejects it by name and no stdin content can
+         * change that verdict, so do not block for input we would discard. */
+        return false;
+    }
+
+    yyjson_doc *schema_doc = yyjson_read(schema_str, strlen(schema_str), 0);
+    if (!schema_doc) {
+        /* The schemas are compile-time constants, so a parse failure means a
+         * malformed literal rather than caller input. Keep the documented stdin
+         * channel rather than silently narrowing it on a schema we could not
+         * read — the gate must only ever fire on positive evidence that the
+         * tool takes no arguments. */
+        return true;
+    }
+    yyjson_val *props = yyjson_obj_get(yyjson_doc_get_root(schema_doc), "properties");
+    bool accepts_arguments = props && yyjson_is_obj(props) && yyjson_obj_size(props) > 0;
+    yyjson_doc_free(schema_doc);
+    return accepts_arguments;
 }
 
 char *cbm_cli_build_args_json(const char *tool_name, int argc, char **argv, char **err_out) {

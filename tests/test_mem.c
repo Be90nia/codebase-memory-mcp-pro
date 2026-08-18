@@ -41,6 +41,32 @@
 
 /* ── mem basic tests ──────────────────────────────────────────── */
 
+/* Since #1360 routed ordinary malloc/new through mimalloc on Linux, the arena
+ * policy governs EVERY allocation in the process, not just the bound
+ * sqlite/tree_sitter populations. With lazy arena commit (0), mimalloc commits
+ * sub-ranges via mprotect(PROT_READ|PROT_WRITE) over a PROT_NONE reservation,
+ * and each partial commit SPLITS the reserved VMA: an index worker on the Go
+ * corpus held ~22k mappings where v0.9.0 held 10, growing with worker count.
+ * That is how #1654's 96-CPU host reached vm.max_map_count, after which mmap
+ * fails for ANY size — 10 KB allocations failing while `free -g` still showed
+ * 246 GB available. mimalloc's own default is 2, meaning "eager-commit arenas
+ * only on an OS that overcommits (i.e. linux)", where commit is free until the
+ * pages are touched; overriding it to 0 opted Linux out of the default written
+ * for Linux. Measured: 22450 -> 17312 mappings, wall time and peak RSS
+ * unchanged. Pin the platform split so the Linux default cannot be silently
+ * opted out again — and keep the lazy setting where commit is NOT free
+ * (Windows especially, see #581). */
+TEST(mem_arena_eager_commit_follows_platform_commit_cost) {
+    cbm_mem_init(0.5);
+    long eager = mi_option_get(mi_option_arena_eager_commit);
+#if defined(__linux__)
+    ASSERT_EQ(eager, 2);
+#else
+    ASSERT_EQ(eager, 0);
+#endif
+    PASS();
+}
+
 TEST(mem_rss_tracking) {
     cbm_mem_init(0.5);
 
@@ -1167,8 +1193,94 @@ TEST(parallel_extract_with_slab) {
     PASS();
 }
 
+/* The memory map is a diagnostic, so it must be proven non-vacuous: a map that
+ * silently reported zeros would read as "no leak" and send a future
+ * investigation down the wrong path. Allocate a KNOWN volume in a KNOWN size
+ * class and require the map to attribute it to that class. */
+TEST(mem_map_attributes_a_known_allocation) {
+    enum { PROBE_BLOCKS = 4000, PROBE_SIZE = 3000 };
+    cbm_mem_map_t before;
+    cbm_mem_map_t after;
+    ASSERT_TRUE(cbm_mem_map_collect(&before));
+
+    /* Allocate through mi_* explicitly. The map walks the mimalloc heap, and
+     * only the PRODUCTION build routes plain malloc there (the test build is
+     * CRT+ASan) -- so a malloc-based probe would report 0 here and wrongly look
+     * like a broken instrument. Using mi_malloc exercises the walk and the
+     * bucket attribution in every build configuration. Note the corollary,
+     * which is why the residual exists: in a build where malloc does NOT reach
+     * mimalloc, live_bytes legitimately reads 0 and the residual owns
+     * everything. */
+    void **kept = malloc(PROBE_BLOCKS * sizeof(*kept));
+    ASSERT_NOT_NULL(kept);
+    for (int i = 0; i < PROBE_BLOCKS; i++) {
+        kept[i] = mi_malloc(PROBE_SIZE);
+        ASSERT_NOT_NULL(kept[i]);
+        ((char *)kept[i])[0] = (char)i; /* touch it so it is really committed */
+    }
+    ASSERT_TRUE(cbm_mem_map_collect(&after));
+
+    /* The walk must account for the bulk of the probe. Slack covers allocator
+     * rounding and blocks the aggregate walk may not reach; a map that saw
+     * ~nothing is precisely the failure this test exists to catch. */
+    size_t probe_bytes = (size_t)PROBE_BLOCKS * PROBE_SIZE;
+    ASSERT_GT(after.live_bytes, before.live_bytes);
+
+    /* Assert the contract the map actually offers, which is the triple in
+     * mem.h: what the walk cannot see, the residual must carry. mimalloc v3
+     * exposes only the main heap, abandoned pages, and the CALLING thread's
+     * theap -- there is no API to enumerate every theap -- so on some builds
+     * the probe's blocks are unreachable through all three (Windows sees
+     * ~190 KB of a 12 MB probe, POSIX sees essentially all of it).
+     *
+     * Demanding >50% attribution everywhere would assert a guarantee the
+     * allocator does not give, and the honest property is stronger anyway: the
+     * memory must appear in the map SOMEWHERE. Either the walk attributes the
+     * bulk of the probe, or the committed total grew by at least as much and
+     * the residual owns it. A map that reported neither would be silently
+     * losing memory, which is exactly what this test exists to catch. */
+    size_t attributed = after.live_bytes - before.live_bytes;
+    size_t committed_growth = after.os_committed_bytes > before.os_committed_bytes
+                                  ? after.os_committed_bytes - before.os_committed_bytes
+                                  : 0;
+    bool walk_saw_it = attributed > probe_bytes / 2;
+    bool residual_saw_it = committed_growth + attributed > probe_bytes / 2;
+    ASSERT_TRUE(walk_saw_it || residual_saw_it);
+
+    /* Bucket attribution is only meaningful where the walk reached the probe;
+     * where it did not, there is nothing to attribute and the residual carried
+     * it above. */
+    /* 3000-byte blocks belong to the <=4096 class, not to a smaller one. */
+    int expected_bucket = -1;
+    for (int i = 0; i < CBM_MEM_MAP_BUCKETS; i++) {
+        size_t limit = cbm_mem_map_bucket_limit(i);
+        if (limit >= (size_t)PROBE_SIZE) {
+            expected_bucket = i;
+            break;
+        }
+    }
+    ASSERT_TRUE(expected_bucket >= 0);
+    if (walk_saw_it) {
+        ASSERT_GT(after.bucket_bytes[expected_bucket], before.bucket_bytes[expected_bucket]);
+        ASSERT_GT(after.bucket_blocks[expected_bucket] - before.bucket_blocks[expected_bucket],
+                  (size_t)(PROBE_BLOCKS / 2));
+    }
+
+    /* OS totals must be populated independently of the walk, so the residual is
+     * meaningful rather than derived from an empty measurement. */
+    ASSERT_GT(after.os_committed_bytes, 0);
+
+    for (int i = 0; i < PROBE_BLOCKS; i++) {
+        mi_free(kept[i]);
+    }
+    free(kept);
+    PASS();
+}
+
 SUITE(mem) {
     /* mem API */
+    RUN_TEST(mem_arena_eager_commit_follows_platform_commit_cost);
+    RUN_TEST(mem_map_attributes_a_known_allocation);
     RUN_TEST(mem_rss_tracking);
     RUN_TEST(mem_collect_reclaims);
     RUN_TEST(mem_budget_check);

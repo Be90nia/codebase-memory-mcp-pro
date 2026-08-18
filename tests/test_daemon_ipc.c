@@ -399,6 +399,36 @@ typedef struct {
     int result;
 } ipc_test_win_startup_call_t;
 
+typedef struct {
+    atomic_bool acquired;
+    atomic_bool may_proceed;
+} ipc_test_startup_gate_t;
+
+/* Runs on the startup thread INSIDE cbm_daemon_ipc_startup_lock_try_acquire,
+ * with the startup lock held and the rendezvous handoff not yet attempted.
+ * Announce that state, then park until the test has released its reader. This
+ * pins the interleaving by construction; the previous version polled for the
+ * lock being busy, which is unobservable whenever the handoff does not block. */
+static void ipc_test_startup_gate(void *context) {
+    ipc_test_startup_gate_t *gate = context;
+    atomic_store(&gate->acquired, true);
+    while (!atomic_load(&gate->may_proceed)) {
+        cbm_usleep(200);
+    }
+}
+
+static bool ipc_test_startup_gate_wait_acquired(ipc_test_startup_gate_t *gate) {
+    /* `acquired` never clears, so this wait cannot miss the event; the bound
+     * only catches a thread that never started at all. */
+    for (size_t attempt = 0; attempt < 50000U; attempt++) {
+        if (atomic_load(&gate->acquired)) {
+            return true;
+        }
+        cbm_usleep(200);
+    }
+    return false;
+}
+
 static void *ipc_test_win_startup_call(void *opaque) {
     ipc_test_win_startup_call_t *call = opaque;
     cbm_daemon_ipc_startup_lock_t *startup = NULL;
@@ -415,14 +445,6 @@ static void ipc_test_win_lock_release(cbm_private_file_lock_t **lock_io) {
            cbm_private_file_lock_release(lock_io) != CBM_PRIVATE_FILE_LOCK_OK) {
         cbm_usleep(1000);
     }
-}
-
-static bool ipc_test_win_lock_busy(cbm_private_lock_directory_t *directory, const char *base_name) {
-    cbm_private_file_lock_t *probe = NULL;
-    cbm_private_file_lock_status_t status =
-        cbm_private_file_lock_try_acquire(directory, base_name, CBM_PRIVATE_FILE_LOCK_SH, &probe);
-    ipc_test_win_lock_release(&probe);
-    return status == CBM_PRIVATE_FILE_LOCK_BUSY;
 }
 #endif
 
@@ -754,6 +776,108 @@ TEST(daemon_ipc_windows_private_directory_rejects_untrusted_ancestor_acl) {
     PASS();
 }
 
+/* A private directory is a container, so its owner-only ACE must propagate.
+ * Otherwise the protected DACL severs inheritance and every child is created
+ * with an empty DACL, unreadable even by its owner. */
+TEST(daemon_ipc_windows_private_directory_ace_is_inheritable) {
+    char parent[TEST_PATH_CAP] = {0};
+    char cache[TEST_PATH_CAP] = {0};
+    bool paths_ok = false;
+    bool secured = false;
+    bool ace_read = false;
+    bool ace_single = false;
+    bool ace_inheritable = false;
+    bool child_has_dacl = false;
+    bool lock_directory_accepted = false;
+
+    if (ipc_test_parent_new(parent, "win-inheritable-ace")) {
+        int written = snprintf(cache, sizeof(cache), "%s/cache", parent);
+        paths_ok = written > 0 && written < (int)sizeof(cache);
+    }
+    if (paths_ok) {
+        secured = cbm_daemon_ipc_private_directory_secure(cache);
+    }
+    if (secured) {
+        PACL dacl = NULL;
+        PSECURITY_DESCRIPTOR descriptor = NULL;
+        LPVOID opaque_ace = NULL;
+        ACL_SIZE_INFORMATION information;
+        memset(&information, 0, sizeof(information));
+        if (GetNamedSecurityInfoA(cache, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL,
+                                  &dacl, NULL, &descriptor) == ERROR_SUCCESS &&
+            dacl &&
+            GetAclInformation(dacl, &information, sizeof(information), AclSizeInformation) &&
+            GetAce(dacl, 0, &opaque_ace) && opaque_ace) {
+            ACCESS_ALLOWED_ACE *ace = (ACCESS_ALLOWED_ACE *)opaque_ace;
+            ace_read = true;
+            /* The owner-only validators require exactly one ACE. An
+             * inheritable ACE built from GENERIC_ALL rather than specific
+             * rights is split by Windows into an effective ACE plus an
+             * INHERIT_ONLY one, which fails that check. */
+            ace_single = information.AceCount == 1;
+            ace_inheritable = (ace->Header.AceFlags & CONTAINER_INHERIT_ACE) != 0 &&
+                              (ace->Header.AceFlags & OBJECT_INHERIT_ACE) != 0;
+        }
+        if (descriptor) {
+            (void)LocalFree(descriptor);
+        }
+    }
+    if (ace_inheritable) {
+        char child[TEST_PATH_CAP] = {0};
+        int written = snprintf(child, sizeof(child), "%s/child", cache);
+        if (written > 0 && written < (int)sizeof(child) && CreateDirectoryA(child, NULL) != 0) {
+            PACL child_dacl = NULL;
+            PSECURITY_DESCRIPTOR child_descriptor = NULL;
+            ACL_SIZE_INFORMATION information;
+            memset(&information, 0, sizeof(information));
+            child_has_dacl =
+                GetNamedSecurityInfoA(child, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL,
+                                      &child_dacl, NULL, &child_descriptor) == ERROR_SUCCESS &&
+                child_dacl &&
+                GetAclInformation(child_dacl, &information, sizeof(information),
+                                  AclSizeInformation) &&
+                information.AceCount > 0;
+            if (child_descriptor) {
+                (void)LocalFree(child_descriptor);
+            }
+            (void)RemoveDirectoryA(child);
+        }
+    }
+
+    if (ace_single) {
+        /* The owner-only DACL validator gates every project lock: a secured
+         * directory it refuses takes the whole coordination layer down with
+         * "secure CLI coordination could not be created (project-locks)". */
+        HANDLE handle =
+            CreateFileA(cache, FILE_READ_ATTRIBUTES | READ_CONTROL,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+        if (handle != INVALID_HANDLE_VALUE) {
+            cbm_private_lock_directory_t *directory = NULL;
+            lock_directory_accepted = cbm_private_lock_directory_adopt_windows(
+                                          handle, cache, &directory) == CBM_PRIVATE_FILE_LOCK_OK &&
+                                      directory;
+            if (directory) {
+                cbm_private_lock_directory_close(directory);
+            } else {
+                (void)CloseHandle(handle);
+            }
+        }
+    }
+
+    (void)RemoveDirectoryA(cache);
+    ipc_test_remove_flat_dir(parent);
+
+    ASSERT_TRUE(paths_ok);
+    ASSERT_TRUE(secured);
+    ASSERT_TRUE(ace_read);
+    ASSERT_TRUE(ace_single);
+    ASSERT_TRUE(ace_inheritable);
+    ASSERT_TRUE(child_has_dacl);
+    ASSERT_TRUE(lock_directory_accepted);
+    PASS();
+}
+
 TEST(daemon_ipc_windows_private_directory_allows_add_subdirectory_only_ancestor) {
     char parent[TEST_PATH_CAP] = {0};
     char add_only[TEST_PATH_CAP] = {0};
@@ -847,10 +971,12 @@ TEST(daemon_ipc_windows_legacy_bridge_covers_handoff_and_lifetime) {
     typedef BOOL(WINAPI * ipc_test_set_dacl_fn)(PSECURITY_DESCRIPTOR, BOOL, PACL, BOOL);
     HMODULE advapi = LoadLibraryW(L"advapi32.dll");
     ipc_test_initialize_sd_fn initialize_sd =
-        advapi ? (ipc_test_initialize_sd_fn)GetProcAddress(advapi, "InitializeSecurityDescriptor")
+        advapi ? (ipc_test_initialize_sd_fn)(void (*)(void))GetProcAddress(
+                     advapi, "InitializeSecurityDescriptor")
                : NULL;
-    ipc_test_set_dacl_fn set_dacl =
-        advapi ? (ipc_test_set_dacl_fn)GetProcAddress(advapi, "SetSecurityDescriptorDacl") : NULL;
+    ipc_test_set_dacl_fn set_dacl = advapi ? (ipc_test_set_dacl_fn)(void (*)(void))GetProcAddress(
+                                                 advapi, "SetSecurityDescriptorDacl")
+                                           : NULL;
     SECURITY_DESCRIPTOR unsafe_descriptor;
     bool unsafe_descriptor_ok = initialize_sd && set_dacl &&
                                 initialize_sd(&unsafe_descriptor, SECURITY_DESCRIPTOR_REVISION) &&
@@ -1028,6 +1154,10 @@ TEST(daemon_ipc_windows_startup_retries_transient_rendezvous_reader) {
     bool startup_observed = false;
     int join_status = -1;
     ipc_test_win_startup_call_t call = {.result = -1};
+    ipc_test_startup_gate_t gate;
+    atomic_init(&gate.acquired, false);
+    atomic_init(&gate.may_proceed, false);
+    cbm_daemon_ipc_startup_gate_set_for_test(ipc_test_startup_gate, &gate);
 
     bool parent_ok = ipc_test_parent_new(parent, "win-record-reader");
     if (parent_ok) {
@@ -1048,14 +1178,11 @@ TEST(daemon_ipc_windows_startup_retries_transient_rendezvous_reader) {
     if (record_status == CBM_PRIVATE_FILE_LOCK_OK) {
         thread_started = cbm_thread_create(&thread, 0, ipc_test_win_startup_call, &call) == 0;
     }
-    for (size_t attempt = 0; thread_started && attempt < 200U; attempt++) {
-        if (ipc_test_win_lock_busy(directory, "cbm-startup-v2.lock")) {
-            startup_observed = true;
-            break;
-        }
-        cbm_usleep(1000);
+    if (thread_started) {
+        startup_observed = ipc_test_startup_gate_wait_acquired(&gate);
     }
     ipc_test_win_lock_release(&record_reader);
+    atomic_store(&gate.may_proceed, true);
     if (thread_started) {
         join_status = cbm_thread_join(&thread);
     }
@@ -1063,6 +1190,7 @@ TEST(daemon_ipc_windows_startup_retries_transient_rendezvous_reader) {
         ipc_test_copy_path(address, cbm_daemon_ipc_endpoint_address(endpoint));
     }
 
+    cbm_daemon_ipc_startup_gate_set_for_test(NULL, NULL);
     ipc_test_win_lock_release(&record_reader);
     cbm_private_lock_directory_close(directory);
     cbm_daemon_ipc_endpoint_free(endpoint);
@@ -1115,6 +1243,11 @@ TEST(daemon_ipc_windows_rendezvous_bridges_concurrent_lifetime_owner) {
     cbm_daemon_ipc_startup_lock_release(&initial_startup);
     initial_startup = NULL;
 
+    ipc_test_startup_gate_t gate;
+    atomic_init(&gate.acquired, false);
+    atomic_init(&gate.may_proceed, false);
+    cbm_daemon_ipc_startup_gate_set_for_test(ipc_test_startup_gate, &gate);
+
     cbm_private_file_lock_status_t directory_status =
         endpoint ? cbm_daemon_ipc_private_lock_directory_new(endpoint, &directory)
                  : CBM_PRIVATE_FILE_LOCK_IO;
@@ -1126,19 +1259,18 @@ TEST(daemon_ipc_windows_rendezvous_bridges_concurrent_lifetime_owner) {
     if (record_status == CBM_PRIVATE_FILE_LOCK_OK) {
         thread_started = cbm_thread_create(&thread, 0, ipc_test_win_startup_call, &call) == 0;
     }
-    for (size_t attempt = 0; thread_started && attempt < 200U; attempt++) {
-        if (ipc_test_win_lock_busy(directory, "cbm-startup-v2.lock")) {
-            startup_observed = true;
-            break;
-        }
-        cbm_usleep(1000);
+    if (thread_started) {
+        startup_observed = ipc_test_startup_gate_wait_acquired(&gate);
     }
+    /* Claim the lifetime lock while startup is parked in the gate, so the
+     * concurrent-owner bridge under test is exercised deterministically. */
     cbm_private_file_lock_status_t lifetime_status =
         startup_observed
             ? cbm_private_file_lock_try_acquire(directory, "cbm-lifetime.lock",
                                                 CBM_PRIVATE_FILE_LOCK_EX, &lifetime_owner)
             : CBM_PRIVATE_FILE_LOCK_IO;
     ipc_test_win_lock_release(&record_reader);
+    atomic_store(&gate.may_proceed, true);
     if (thread_started) {
         join_status = cbm_thread_join(&thread);
     }
@@ -1147,6 +1279,7 @@ TEST(daemon_ipc_windows_rendezvous_bridges_concurrent_lifetime_owner) {
     }
     ipc_test_win_lock_release(&lifetime_owner);
 
+    cbm_daemon_ipc_startup_gate_set_for_test(NULL, NULL);
     ipc_test_win_lock_release(&record_reader);
     ipc_test_win_lock_release(&lifetime_owner);
     cbm_private_lock_directory_close(directory);
@@ -1534,8 +1667,7 @@ TEST(daemon_ipc_endpoint_is_namespaced_by_instance_key) {
     if (a_startup_status == 1 && !cbm_daemon_ipc_startup_lock_prepare_handoff(a_startup)) {
         a_startup_status = -1;
     }
-    if (other_startup_status == 1 &&
-        !cbm_daemon_ipc_startup_lock_prepare_handoff(other_startup)) {
+    if (other_startup_status == 1 && !cbm_daemon_ipc_startup_lock_prepare_handoff(other_startup)) {
         other_startup_status = -1;
     }
     cbm_daemon_ipc_startup_lock_release(&a_startup);
@@ -2072,6 +2204,13 @@ typedef struct {
     int receive_result;
 } ipc_forever_wait_server_t;
 
+/* The connection is deliberately NOT closed here. The test interrupts this
+ * thread's wait through server->connection, and `receive_frame` can also return
+ * on its own (a torn connection, an early frame) before that call lands.
+ * Closing from this thread therefore freed the connection while the test was
+ * still dereferencing the pointer it had already loaded — a use-after-free that
+ * crashed roughly one Windows run in five. Ownership stays with the test, which
+ * closes it after joining, so `interrupt` can only ever see a live connection. */
 static void *ipc_forever_wait_server(void *opaque) {
     ipc_forever_wait_server_t *server = (ipc_forever_wait_server_t *)opaque;
     cbm_daemon_frame_t frame = {0};
@@ -2084,8 +2223,6 @@ static void *ipc_forever_wait_server(void *opaque) {
             server->connection, CBM_DAEMON_IPC_WAIT_FOREVER, &frame, &payload);
     }
     free(payload);
-    cbm_daemon_ipc_connection_close(server->connection);
-    server->connection = NULL;
     return NULL;
 }
 
@@ -2129,6 +2266,9 @@ TEST(daemon_ipc_wait_forever_is_interruptible) {
     if (thread_started) {
         join_result = cbm_thread_join(&thread);
     }
+    /* Safe only after the join: the server thread no longer touches it. */
+    cbm_daemon_ipc_connection_close(server.connection);
+    server.connection = NULL;
     cbm_daemon_ipc_connection_close(client);
     cbm_daemon_ipc_listener_close(listener);
     cbm_daemon_ipc_endpoint_free(endpoint);
@@ -4571,6 +4711,83 @@ TEST(daemon_ipc_posix_rejects_non_socket_and_symlink_endpoints) {
 
 #endif /* !_WIN32 */
 
+#ifndef _WIN32
+/* #1537: the daemon's private-directory ancestry walk refused ANY group-write
+ * bit on an ancestor — the same rule #1535 removed on the activation side, and
+ * the sibling the consolidated strictness decision covers but that never got
+ * changed. A group-writable ~ or ~/.cache is ordinary (WSL2 ships 0775, so do
+ * several distro skeletons and any shared-primary-group site), so the daemon
+ * was unusable there. World-writable must still be refused: any local user
+ * could swap a path component. And the private directory itself must still end
+ * up owner-private, which is what makes admitting the ancestor safe. */
+TEST(daemon_ipc_posix_group_writable_ancestor_is_admitted_issue1537) {
+    char parent[TEST_PATH_CAP];
+    char ancestor[TEST_PATH_CAP];
+    char cache[TEST_PATH_CAP];
+    bool paths_ok = false;
+    bool ancestor_ready = false;
+    bool secured = false;
+    bool leaf_owner_private = false;
+
+    if (ipc_test_parent_new(parent, "posix-group-writable-ancestor")) {
+        int a = snprintf(ancestor, sizeof(ancestor), "%s/group-writable", parent);
+        int c = snprintf(cache, sizeof(cache), "%s/cache", ancestor);
+        paths_ok = a > 0 && a < (int)sizeof(ancestor) && c > 0 && c < (int)sizeof(cache);
+    }
+    if (paths_ok) {
+        ancestor_ready = mkdir(ancestor, 0775) == 0 && chmod(ancestor, 0775) == 0;
+    }
+    if (ancestor_ready) {
+        secured = cbm_daemon_ipc_private_directory_secure(cache);
+        struct stat leaf;
+        leaf_owner_private =
+            stat(cache, &leaf) == 0 && S_ISDIR(leaf.st_mode) && (leaf.st_mode & 07777) == 0700;
+    }
+
+    (void)rmdir(cache);
+    (void)rmdir(ancestor);
+    ipc_test_remove_flat_dir(parent);
+
+    ASSERT_TRUE(paths_ok);
+    ASSERT_TRUE(ancestor_ready);
+    ASSERT_TRUE(secured);
+    ASSERT_TRUE(leaf_owner_private);
+    PASS();
+}
+
+/* The other half of the same decision: world-writable stays refused. A rule
+ * that admitted everything would "fix" #1537 by removing the protection. */
+TEST(daemon_ipc_posix_world_writable_ancestor_still_refused_issue1537) {
+    char parent[TEST_PATH_CAP];
+    char ancestor[TEST_PATH_CAP];
+    char cache[TEST_PATH_CAP];
+    bool paths_ok = false;
+    bool ancestor_ready = false;
+    bool refused = false;
+
+    if (ipc_test_parent_new(parent, "posix-world-writable-ancestor")) {
+        int a = snprintf(ancestor, sizeof(ancestor), "%s/world-writable", parent);
+        int c = snprintf(cache, sizeof(cache), "%s/cache", ancestor);
+        paths_ok = a > 0 && a < (int)sizeof(ancestor) && c > 0 && c < (int)sizeof(cache);
+    }
+    if (paths_ok) {
+        ancestor_ready = mkdir(ancestor, 0777) == 0 && chmod(ancestor, 0777) == 0;
+    }
+    if (ancestor_ready) {
+        refused = !cbm_daemon_ipc_private_directory_secure(cache);
+    }
+
+    (void)rmdir(cache);
+    (void)rmdir(ancestor);
+    ipc_test_remove_flat_dir(parent);
+
+    ASSERT_TRUE(paths_ok);
+    ASSERT_TRUE(ancestor_ready);
+    ASSERT_TRUE(refused);
+    PASS();
+}
+#endif /* !_WIN32 */
+
 SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_pending_timeout_race_returns_completed_io);
     RUN_TEST(daemon_ipc_pending_wait_failure_cancels_and_drains);
@@ -4581,6 +4798,7 @@ SUITE(daemon_ipc) {
 #ifdef _WIN32
     RUN_TEST(daemon_ipc_windows_default_endpoint_ignores_temp_environment);
     RUN_TEST(daemon_ipc_windows_private_directory_rejects_untrusted_ancestor_acl);
+    RUN_TEST(daemon_ipc_windows_private_directory_ace_is_inheritable);
     RUN_TEST(daemon_ipc_windows_private_directory_allows_add_subdirectory_only_ancestor);
     RUN_TEST(daemon_ipc_windows_legacy_bridge_covers_handoff_and_lifetime);
     RUN_TEST(daemon_ipc_windows_local_transition_atomically_reserves_legacy_pipe);
@@ -4608,6 +4826,8 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_windows_startup_release_retains_retry_authority);
     RUN_TEST(daemon_ipc_frame_timeout_poisons_connection);
 #ifndef _WIN32
+    RUN_TEST(daemon_ipc_posix_group_writable_ancestor_is_admitted_issue1537);
+    RUN_TEST(daemon_ipc_posix_world_writable_ancestor_still_refused_issue1537);
     RUN_TEST(daemon_ipc_posix_startup_lock_is_cross_process);
     RUN_TEST(daemon_ipc_posix_lifetime_reservation_rejects_fork_inheritance);
     RUN_TEST(daemon_ipc_posix_child_participant_handoff_retains_legacy_bridge);

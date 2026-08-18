@@ -34,6 +34,14 @@ const char *cbm_cli_get_version(void);
  * must free. Caller frees the returned JSON string. */
 char *cbm_cli_build_args_json(const char *tool_name, int argc, char **argv, char **err_out);
 
+/* Decide whether `cli <tool>` may take its JSON arguments from stdin, given
+ * that no --args-file, raw-JSON positional and no --flag form was supplied.
+ * stdin_is_tty is the caller's isatty(0) result. True only for a non-terminal
+ * stdin AND a tool whose input_schema declares at least one property; a
+ * zero-argument tool such as list_projects must never read stdin, because an
+ * inherited-but-never-closed pipe makes that read block forever (#1359). */
+bool cbm_cli_args_from_stdin_allowed(const char *tool_name, bool stdin_is_tty);
+
 /* Print per-tool help (usage + the tool's flags with type/description/required)
  * derived from its input_schema, to stdout. Returns 0 if the tool is known,
  * non-zero (and prints nothing) if it is not. */
@@ -195,6 +203,25 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir);
 int cbm_install_agent_configs(const char *home, const char *binary_path, bool force, bool dry_run);
 
 #ifdef CBM_CLI_ENABLE_TEST_API
+/* #1558: client-selector vocabulary, exposed so a test can prove every token
+ * resolves and an unknown one is rejected. */
+bool cbm_cli_clients_apply_selection_for_testing(const char *spec, cbm_detected_agents_t *detected);
+size_t cbm_cli_clients_count_for_testing(void);
+const char *cbm_cli_clients_token_for_testing(size_t index);
+#endif
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+/* #1566: name the package manager that owns a binary path, or NULL when it is
+ * not recognisably foreign. Detection must be positive evidence — see the
+ * implementation comment. */
+const char *cbm_cli_external_manager_name_for_testing(const char *self_path);
+/* #1558: expose the config-key table so a test can prove a key is discoverable
+ * (`config list`/`set` both walk it). */
+size_t cbm_cli_config_key_count_for_testing(void);
+const char *cbm_cli_config_key_at_for_testing(size_t index);
+#endif
+
+#ifdef CBM_CLI_ENABLE_TEST_API
 int cbm_build_qwen_hook_command_for_testing(const char *binary_path, bool windows, char *command,
                                             size_t command_size, char *shell, size_t shell_size);
 int cbm_build_qoder_hook_command_for_testing(const char *binary_path, bool windows, char *command,
@@ -220,6 +247,14 @@ bool cbm_hook_augment_invocation_supported_for_testing(const char *dialect,
 bool cbm_hook_path_contains_for_testing(const char *root, const char *candidate,
                                         bool case_insensitive);
 const char *cbm_hook_no_project_index_guidance_for_testing(const char *event);
+bool cbm_mcp_command_path_probe_safe_for_testing(const char *command, bool windows);
+void cbm_set_mcp_command_path_probe_counter_for_testing(int *counter);
+int cbm_install_editor_mcp_with_previous_for_testing(const char *binary_path,
+                                                     const char *previous_binary_path,
+                                                     const char *config_path);
+int cbm_upsert_junie_mcp_with_previous_for_testing(const char *binary_path,
+                                                   const char *previous_binary_path,
+                                                   const char *config_path);
 #endif
 
 /* ── Agent MCP config upsert (per agent) ──────────────────────── */
@@ -328,7 +363,11 @@ int cbm_ensure_path(const char *bin_dir, const char *rc_file, bool dry_run);
 /* Get the Codex CLI instructions content. */
 const char *cbm_get_codex_instructions(void);
 
-/* ── Tar.gz extraction ────────────────────────────────────────── */
+/* ── Tar.gz / zip extraction (TEST-ONLY) ──────────────────────────
+ * Reachable only from the excluded in-process updater and tests/test_cli.c.
+ * Declared and defined under the test guard so the capability is absent from
+ * release artifacts rather than present-but-unreachable. */
+#ifdef CBM_CLI_ENABLE_TEST_API
 
 /* Extract a binary named "codebase-memory-mcp*" from a tar.gz buffer.
  * Returns malloc'd binary content and sets *out_len.
@@ -340,18 +379,7 @@ unsigned char *cbm_extract_binary_from_targz(const unsigned char *data, int data
  * Returns NULL on error. Caller must free. */
 unsigned char *cbm_extract_binary_from_zip(const unsigned char *data, int data_len, int *out_len);
 
-/* Strict two-file Windows release bundle extraction. The archive must contain
- * exactly one root launcher and one root payload; ambiguous aliases,
- * traversal, duplicates, and malformed central/local metadata fail closed. */
-typedef struct {
-    unsigned char *launcher;
-    int launcher_len;
-    unsigned char *payload;
-    int payload_len;
-} cbm_windows_release_pair_t;
-bool cbm_extract_windows_release_pair_from_zip(const unsigned char *data, int data_len,
-                                               cbm_windows_release_pair_t *pair_out);
-void cbm_windows_release_pair_free(cbm_windows_release_pair_t *pair);
+#endif /* CBM_CLI_ENABLE_TEST_API */
 
 /* ── Index management ─────────────────────────────────────────── */
 
@@ -394,6 +422,10 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key);
 #define CBM_CONFIG_AUTO_INDEX_LIMIT "auto_index_limit"
 #define CBM_CONFIG_AUTO_WATCH "auto_watch"
 #define CBM_CONFIG_UI_LANG "ui-lang"
+/* #1558: the graph UI's loopback listener. Stored in the UI config file rather
+ * than the key-value store, but surfaced through `config` so it is findable. */
+#define CBM_CONFIG_UI_ENABLED "ui_enabled"
+#define CBM_CONFIG_UI_PORT "ui_port"
 
 /* ── Binary activation safety ─────────────────────────────────── */
 
@@ -439,14 +471,6 @@ void cbm_cli_set_activation_ops_for_test(const cbm_cli_activation_ops_t *ops);
  * command-line or environment override. */
 void cbm_cli_set_activation_runtime_parent_for_test(const char *runtime_parent);
 
-/* Consume and authenticate any inherited permanent-launcher context before
- * process-role classification. An absent context is the normal portable
- * payload case; an advertised but invalid context fails closed. */
-int cbm_cli_windows_launcher_startup_authenticate(int argc, char *const argv[]);
-/* Internal release-pair probe. Returns -1 when argv does not select the role,
- * otherwise a process exit code. It runs before cache/daemon initialization. */
-int cbm_cli_windows_payload_descriptor_role(int argc, char *const argv[]);
-
 /* ── Subcommands (wired from main.c) ─────────────────────────── */
 
 /* install: copy binary, install skills, install editor MCP configs, ensure PATH.
@@ -458,6 +482,12 @@ int cbm_cmd_uninstall(int argc, char **argv);
 
 /* update: check latest release, prompt for index deletion, prompt for ui/standard,
  * download and replace binary. */
+/* True when the installer script (install.sh / install.ps1 on Windows) is
+ * present beside the binary. `update` prints a command built from this;
+ * naming a path that does not exist ends the interaction on a failing
+ * command (#1632). Exposed for testing. */
+bool cbm_cli_installer_beside_binary(const char *dir);
+
 int cbm_cmd_update(int argc, char **argv);
 
 /* config: get/set/list/reset runtime config values. */
@@ -483,6 +513,20 @@ char *cbm_hook_augment_lifecycle_json_for(const char *input, const char *forced_
  * hard fail-open deadline without constructing a local MCP/store instance. */
 void cbm_hook_augment_arm_deadline(void);
 char *cbm_hook_augment_read_stdin(void);
+
+/* Why a hook client is not augmenting. The hook caller only ever sees stdout,
+ * so each reason that is actionable by the user must have a stdout notice
+ * (#1388: a build-conflicted daemon used to report on stderr alone, which is
+ * invisible in-session and reads as silent skips). */
+typedef enum {
+    CBM_HOOK_ADMISSION_DAEMON_ABSENT = 0, /* no daemon running: `daemon start` heals it */
+    CBM_HOOK_ADMISSION_BUILD_CONFLICT     /* daemon runs another build: needs `daemon stop` */
+} cbm_hook_admission_t;
+
+/* The JSON systemMessage a hook client must print on stdout for `reason`, or
+ * NULL when nothing should be printed. hook_dialect NULL = Claude Code, the
+ * only dialect that surfaces a stdout systemMessage to the user. */
+const char *cbm_hook_admission_notice(cbm_hook_admission_t reason, const char *hook_dialect);
 
 /* Process one already-read hook payload using a caller-owned MCP session.
  * Returns a malloc-owned hook output JSON string, or NULL for fail-open/no

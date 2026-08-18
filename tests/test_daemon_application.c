@@ -13,6 +13,7 @@
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
 #include "foundation/platform.h"
+#include "foundation/sha256.h"
 #include "foundation/subprocess.h"
 #include "mcp/mcp.h"
 #include "mcp/mcp_internal.h"
@@ -512,6 +513,145 @@ TEST(daemon_application_ui_config_rejects_noncanonical_frames) {
     ASSERT_FALSE(unchanged.ui_enabled);
     ASSERT_EQ(unchanged.ui_port, 9749);
     ASSERT_TRUE(stopped);
+    PASS();
+}
+
+TEST(daemon_application_ui_readiness_proof_is_generation_bound_before_context) {
+    uint8_t first_secret[CBM_SHA256_DIGEST_LEN];
+    uint8_t second_secret[CBM_SHA256_DIGEST_LEN];
+    uint8_t request[1U + CBM_SHA256_DIGEST_LEN];
+    for (size_t index = 0; index < CBM_SHA256_DIGEST_LEN; index++) {
+        first_secret[index] = (uint8_t)index;
+        second_secret[index] = (uint8_t)(index + 1U);
+        request[index + 1U] = (uint8_t)(index + 32U);
+    }
+    request[0] = CBM_DAEMON_APPLICATION_REQUEST_UI_READINESS_PROOF;
+    static const uint8_t expected_first[CBM_SHA256_DIGEST_LEN] = {
+        0x62, 0x21, 0x5d, 0xe7, 0xbd, 0xdc, 0xea, 0x7e, 0x2c, 0x40, 0x47,
+        0xff, 0x6b, 0xb9, 0x4f, 0x8d, 0x18, 0x26, 0x2f, 0xc8, 0xb3, 0xf3,
+        0x64, 0x81, 0x34, 0xbb, 0x7d, 0x44, 0x15, 0x8f, 0xf8, 0x4d,
+    };
+    static const uint8_t expected_second[CBM_SHA256_DIGEST_LEN] = {
+        0xe3, 0xb0, 0x69, 0x53, 0x9c, 0x19, 0xc2, 0x2d, 0x3f, 0x6d, 0x34,
+        0x60, 0x67, 0x86, 0x15, 0x78, 0xbe, 0xa9, 0xc4, 0xb9, 0xe4, 0x61,
+        0xcb, 0xf9, 0xb8, 0x06, 0xad, 0x1b, 0xcd, 0x64, 0xa4, 0x81,
+    };
+
+    cbm_daemon_application_config_t first_config = {
+        .ui_readiness_secret = first_secret,
+        .ui_readiness_secret_length = sizeof(first_secret),
+    };
+    cbm_daemon_application_config_t second_config = {
+        .ui_readiness_secret = second_secret,
+        .ui_readiness_secret_length = sizeof(second_secret),
+    };
+    cbm_daemon_application_t *first = cbm_daemon_application_new(&first_config);
+    cbm_daemon_application_t *second = cbm_daemon_application_new(&second_config);
+    cbm_daemon_application_t *without_secret = cbm_daemon_application_new(NULL);
+    cbm_daemon_application_config_t malformed_config = {
+        .ui_readiness_secret = first_secret,
+        .ui_readiness_secret_length = sizeof(first_secret) - 1U,
+    };
+    cbm_daemon_application_t *malformed = cbm_daemon_application_new(&malformed_config);
+
+    cbm_daemon_runtime_application_callbacks_t first_callbacks =
+        cbm_daemon_application_runtime_callbacks(first);
+    cbm_daemon_runtime_application_callbacks_t second_callbacks =
+        cbm_daemon_application_runtime_callbacks(second);
+    cbm_daemon_runtime_application_callbacks_t no_secret_callbacks =
+        cbm_daemon_application_runtime_callbacks(without_secret);
+    cbm_daemon_runtime_application_session_t *first_session =
+        first ? app_test_open(&first_callbacks, 304) : NULL;
+    cbm_daemon_runtime_application_session_t *second_session =
+        second ? app_test_open(&second_callbacks, 305) : NULL;
+    cbm_daemon_runtime_application_session_t *no_secret_session =
+        without_secret ? app_test_open(&no_secret_callbacks, 306) : NULL;
+
+    uint8_t *first_response = NULL;
+    uint32_t first_length = 0;
+    cbm_daemon_runtime_application_status_t first_status =
+        first_session ? app_test_request(&first_callbacks, first_session, request, sizeof(request),
+                                         &first_response, &first_length)
+                      : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    uint8_t *second_response = NULL;
+    uint32_t second_length = 0;
+    cbm_daemon_runtime_application_status_t second_status =
+        second_session ? app_test_request(&second_callbacks, second_session, request,
+                                          sizeof(request), &second_response, &second_length)
+                       : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    uint8_t *malformed_response = NULL;
+    uint32_t malformed_length = 0;
+    cbm_daemon_runtime_application_status_t short_status =
+        first_session
+            ? app_test_request(&first_callbacks, first_session, request, sizeof(request) - 1U,
+                               &malformed_response, &malformed_length)
+            : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    free(malformed_response);
+    malformed_response = NULL;
+    malformed_length = 0;
+    uint8_t long_request[2U + CBM_SHA256_DIGEST_LEN];
+    memcpy(long_request, request, sizeof(request));
+    long_request[sizeof(long_request) - 1U] = 0;
+    cbm_daemon_runtime_application_status_t long_status =
+        first_session
+            ? app_test_request(&first_callbacks, first_session, long_request, sizeof(long_request),
+                               &malformed_response, &malformed_length)
+            : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    free(malformed_response);
+    malformed_response = NULL;
+    malformed_length = 0;
+    cbm_daemon_runtime_application_status_t no_secret_status =
+        no_secret_session
+            ? app_test_request(&no_secret_callbacks, no_secret_session, request, sizeof(request),
+                               &malformed_response, &malformed_length)
+            : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    free(malformed_response);
+
+    if (first_session) {
+        first_callbacks.session_close(first_callbacks.context, first_session);
+    }
+    if (second_session) {
+        second_callbacks.session_close(second_callbacks.context, second_session);
+    }
+    if (no_secret_session) {
+        no_secret_callbacks.session_close(no_secret_callbacks.context, no_secret_session);
+    }
+    bool first_stopped = first && cbm_daemon_application_shutdown(first, APP_TEST_TIMEOUT_MS);
+    bool second_stopped = second && cbm_daemon_application_shutdown(second, APP_TEST_TIMEOUT_MS);
+    bool no_secret_stopped =
+        without_secret && cbm_daemon_application_shutdown(without_secret, APP_TEST_TIMEOUT_MS);
+    bool malformed_rejected = malformed == NULL;
+    bool first_exact = first_response && first_length == sizeof(expected_first) &&
+                       memcmp(first_response, expected_first, sizeof(expected_first)) == 0;
+    bool second_exact = second_response && second_length == sizeof(expected_second) &&
+                        memcmp(second_response, expected_second, sizeof(expected_second)) == 0;
+    bool generations_differ = first_response && second_response &&
+                              memcmp(first_response, second_response, CBM_SHA256_DIGEST_LEN) != 0;
+    cbm_daemon_application_free(first);
+    cbm_daemon_application_free(second);
+    cbm_daemon_application_free(without_secret);
+    cbm_daemon_application_free(malformed);
+    free(first_response);
+    free(second_response);
+
+    ASSERT_NOT_NULL(first);
+    ASSERT_NOT_NULL(second);
+    ASSERT_NOT_NULL(without_secret);
+    ASSERT_TRUE(malformed_rejected);
+    ASSERT_NOT_NULL(first_session);
+    ASSERT_NOT_NULL(second_session);
+    ASSERT_NOT_NULL(no_secret_session);
+    ASSERT_EQ(first_status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_TRUE(first_exact);
+    ASSERT_EQ(second_status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_TRUE(second_exact);
+    ASSERT_TRUE(generations_differ);
+    ASSERT_EQ(short_status, CBM_DAEMON_RUNTIME_APPLICATION_REJECTED);
+    ASSERT_EQ(long_status, CBM_DAEMON_RUNTIME_APPLICATION_REJECTED);
+    ASSERT_EQ(no_secret_status, CBM_DAEMON_RUNTIME_APPLICATION_REJECTED);
+    ASSERT_TRUE(first_stopped);
+    ASSERT_TRUE(second_stopped);
+    ASSERT_TRUE(no_secret_stopped);
     PASS();
 }
 
@@ -1458,19 +1598,6 @@ static bool app_wait_for_active_jobs(cbm_daemon_application_t *application, size
             return true;
         }
         cbm_usleep(1000);
-    }
-    return false;
-}
-
-static bool app_wait_for_terminal_job_with_subscribers(cbm_daemon_application_t *application,
-                                                       const char *project,
-                                                       size_t minimum_subscribers) {
-    uint64_t deadline = cbm_now_ms() + APP_TEST_TIMEOUT_MS;
-    while (cbm_now_ms() < deadline) {
-        if (cbm_daemon_application_active_jobs(application) == 0 &&
-            cbm_daemon_application_job_subscribers(application, project) >= minimum_subscribers) {
-            return true;
-        }
     }
     return false;
 }
@@ -2642,16 +2769,21 @@ TEST(daemon_application_fresh_request_does_not_reuse_terminal_subscribed_job) {
     bool first_worker_ready_to_publish =
         all_subscribed && app_wait_for_atomic_int(&fake.destroys, 1);
     atomic_store(&fake.release_destroy, true);
-    bool terminal_with_prior_subscribers =
-        first_worker_ready_to_publish &&
-        app_wait_for_terminal_job_with_subscribers(application, project, PRIOR_SUBSCRIBERS / 2U);
+    /* Wait only for the stable end-state. Publish flips terminal and lets the
+     * blocked prior requests drain in the same breath, so "terminal AND still
+     * subscribed" is a transient window no poll cadence can pin (release runs
+     * 30305464193 and 30309182389 missed it from both directions). The
+     * production guard ignores subscriber counts — find_active_job skips any
+     * terminal job — and the stale/fresh assertions below catch a reuse in
+     * every interleaving. */
+    bool job_terminal = first_worker_ready_to_publish && app_wait_for_active_jobs(application, 0);
 
     uint8_t *fresh = NULL;
     uint32_t fresh_length = 0;
     cbm_daemon_runtime_application_status_t fresh_status =
-        terminal_with_prior_subscribers ? app_test_request(&callbacks, sessions[PRIOR_SUBSCRIBERS],
-                                                           tool, tool_length, &fresh, &fresh_length)
-                                        : CBM_DAEMON_RUNTIME_APPLICATION_REJECTED;
+        job_terminal ? app_test_request(&callbacks, sessions[PRIOR_SUBSCRIBERS], tool, tool_length,
+                                        &fresh, &fresh_length)
+                     : CBM_DAEMON_RUNTIME_APPLICATION_REJECTED;
     for (size_t i = 0; i < PRIOR_SUBSCRIBERS; i++) {
         if (started[i]) {
             (void)cbm_thread_join(&threads[i]);
@@ -2668,7 +2800,7 @@ TEST(daemon_application_fresh_request_does_not_reuse_terminal_subscribed_job) {
     ASSERT_TRUE(setup);
     ASSERT_TRUE(all_subscribed);
     ASSERT_TRUE(first_worker_ready_to_publish);
-    ASSERT_TRUE(terminal_with_prior_subscribers);
+    ASSERT_TRUE(job_terminal);
     ASSERT_EQ(fresh_status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
     ASSERT_EQ(atomic_load(&fake.starts), 2);
     ASSERT_EQ(atomic_load(&fake.destroys), 2);
@@ -2863,10 +2995,17 @@ TEST(daemon_application_cancels_physical_job_only_after_final_session) {
         started[i] = cbm_thread_create(&threads[i], 0, app_request_thread, &requests[i]) == 0;
     }
     bool subscribed = started[0] && started[1] && app_wait_for_subscribers(application, project, 2);
-    if (subscribed) {
+    /* The physical job starts asynchronously once a session subscribes, so a
+     * subscriber count of 2 does NOT imply it has started. Cancelling both
+     * sessions before that point leaves starts == 0 -- arguably the correct
+     * outcome, and the reason this test failed intermittently on Windows while
+     * passing everywhere else. Wait for the state the assertions below actually
+     * require; `starts` only increments, so this cannot miss the transition. */
+    bool job_started = subscribed && app_wait_for_atomic_int(&fake.starts, 1);
+    if (job_started) {
         callbacks.session_cancel(callbacks.context, sessions[0]);
     }
-    bool one_left = subscribed && app_wait_for_subscribers(application, project, 1);
+    bool one_left = job_started && app_wait_for_subscribers(application, project, 1);
     int cancels_after_first = atomic_load(&fake.cancels);
     if (one_left) {
         callbacks.session_cancel(callbacks.context, sessions[1]);
@@ -2882,6 +3021,7 @@ TEST(daemon_application_cancels_physical_job_only_after_final_session) {
 
     ASSERT_TRUE(setup);
     ASSERT_TRUE(subscribed);
+    ASSERT_TRUE(job_started);
     ASSERT_TRUE(one_left);
     ASSERT_EQ(atomic_load(&fake.starts), 1);
     ASSERT_EQ(cancels_after_first, 0);
@@ -4870,12 +5010,86 @@ TEST(daemon_application_rejects_clean_exit_when_process_tree_is_not_contained) {
     PASS();
 }
 
+/* #1375: a reply too large to frame must become a JSON-RPC ERROR, not a
+ * transport failure.
+ *
+ * Why this matters more than it looks: the frontend worker cannot tell a
+ * rejected oversized frame from a dead socket, and for a dead socket it
+ * deliberately _Exit()s the process (closing the kernel IPC handle is the only
+ * portable way to cancel daemon session ownership from a thread blocked in
+ * stdio). So passing an oversized reply DOWN to the transport killed the whole
+ * server — every tool gone for the rest of the session, exit=1, empty stderr.
+ * The substitution therefore has to happen here, at the layer that still holds
+ * the request id.
+ *
+ * Reproduced end-to-end before fixing, on a 20k-node fixture: LIMIT 10000 ->
+ * 8,529,990 bytes ok; LIMIT 20000 -> SERVER DIED exit=1. After: the same query
+ * returns this error and a follow-up query on the SAME session succeeds. */
+TEST(daemon_application_oversized_reply_is_a_jsonrpc_error_not_a_death) {
+    cbm_jsonrpc_request_t request = {0};
+    request.has_id = true;
+    request.id = 42;
+
+    /* A reply that FITS must pass through byte-identical — the guard must not
+     * touch the overwhelming majority of replies. */
+    char *small = strdup("{\"jsonrpc\":\"2.0\",\"id\":42,\"result\":{}}");
+    ASSERT_NOT_NULL(small);
+    char *kept = cbm_daemon_application_framable_response_for_test(small, &request);
+    ASSERT_TRUE(kept == small); /* same pointer: untouched */
+    ASSERT_STR_EQ(kept, "{\"jsonrpc\":\"2.0\",\"id\":42,\"result\":{}}");
+    free(kept);
+
+    /* A reply that CANNOT be framed must come back as a JSON-RPC error instead.
+     * Passing it on is what killed the server: the frontend worker cannot tell a
+     * rejected oversized frame from a dead socket, and for a dead socket it
+     * deliberately _Exit()s the process — so every tool on that server was gone
+     * for the rest of the session, with exit=1 and an empty stderr (#1375).
+     * Reproduced end-to-end on a 20k-node fixture before fixing: LIMIT 10000 ->
+     * 8,529,990 bytes ok, LIMIT 20000 -> SERVER DIED. After: the same query
+     * returns this error and a follow-up query on the SAME session succeeds. */
+    size_t oversized = (size_t)CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX + 1U;
+    char *big = malloc(oversized + 1U);
+    ASSERT_NOT_NULL(big);
+    memset(big, 'x', oversized);
+    big[oversized] = '\0';
+
+    char *replaced = cbm_daemon_application_framable_response_for_test(big, &request);
+    ASSERT_NOT_NULL(replaced);
+    ASSERT_TRUE(replaced != big); /* substituted, not passed through */
+
+    /* The replacement must itself fit, or it reproduces the bug it replaces. */
+    ASSERT_TRUE(strlen(replaced) <= (size_t)CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX);
+    /* ...and carry the caller's id, or the client cannot match reply to request. */
+    ASSERT_NOT_NULL(strstr(replaced, "\"error\""));
+    ASSERT_NOT_NULL(strstr(replaced, "\"id\":42"));
+    ASSERT_NOT_NULL(strstr(replaced, "-32603"));
+    /* ...and say what happened and what to do: the failure it replaces was a
+     * SILENT exit, so an opaque "internal error" would be no improvement. */
+    ASSERT_NOT_NULL(strstr(replaced, "response too large"));
+    ASSERT_NOT_NULL(strstr(replaced, "LIMIT"));
+    free(replaced);
+
+    /* An unparseable message has no id to echo, but must still yield an error
+     * rather than NULL — NULL is turned back into a hard failure by the caller. */
+    char *big2 = malloc(oversized + 1U);
+    ASSERT_NOT_NULL(big2);
+    memset(big2, 'y', oversized);
+    big2[oversized] = '\0';
+    char *anonymous = cbm_daemon_application_framable_response_for_test(big2, NULL);
+    ASSERT_NOT_NULL(anonymous);
+    ASSERT_NOT_NULL(strstr(anonymous, "\"error\""));
+    free(anonymous);
+    PASS();
+}
+
 SUITE(daemon_application) {
+    RUN_TEST(daemon_application_oversized_reply_is_a_jsonrpc_error_not_a_death);
     RUN_TEST(daemon_application_new_session_does_not_retain_initial_store);
     RUN_TEST(daemon_application_request_cancel_is_scoped_to_exact_token);
     RUN_TEST(daemon_application_requires_immutable_explicit_context);
     RUN_TEST(daemon_application_ui_config_updates_are_masked_and_serialized);
     RUN_TEST(daemon_application_ui_config_rejects_noncanonical_frames);
+    RUN_TEST(daemon_application_ui_readiness_proof_is_generation_bound_before_context);
     RUN_TEST(daemon_application_restricted_profile_owns_no_background_surfaces);
     RUN_TEST(daemon_application_hook_context_preserves_event_and_dialect);
     RUN_TEST(daemon_application_mcp_notification_has_no_response);

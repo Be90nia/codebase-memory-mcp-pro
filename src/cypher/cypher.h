@@ -262,15 +262,23 @@ typedef struct {
     int arg_count;
 } cbm_return_item_t;
 
+/* Upper bound on ORDER BY sort keys. Queries with more keys are rejected at
+ * parse time: an unmodeled key must be a loud error, never a silently dropped
+ * remainder (#1334 - the unconsumed tail swallowed the LIMIT clause). */
+#define CBM_CYPHER_ORDER_KEYS_MAX 8
+
 typedef struct {
     cbm_return_item_t *items;
     int count;
     bool distinct;
-    bool star;             /* RETURN * */
-    const char *order_by;  /* "variable.property" or "COUNT(var)" or alias */
-    const char *order_dir; /* "ASC" or "DESC", NULL = default */
-    int skip;              /* SKIP N, 0 = none */
-    int limit;             /* 0 = default */
+    bool star; /* RETURN * */
+    /* ORDER BY key list, in priority order. Each key is "variable.property",
+     * "COUNT(var)" or an alias; direction is per key (Cypher semantics). */
+    const char *order_keys[CBM_CYPHER_ORDER_KEYS_MAX];
+    bool order_descs[CBM_CYPHER_ORDER_KEYS_MAX]; /* false = ASC (default) */
+    int order_key_count;                         /* 0 = no ORDER BY */
+    int skip;                                    /* SKIP N, 0 = none */
+    int limit;                                   /* 0 = default */
 } cbm_return_clause_t;
 
 /* Full query AST */
@@ -341,5 +349,11 @@ void cbm_query_free(cbm_query_t *q);
  * subsequent queries on the calling thread. 0 = trip on the first hot-loop
  * check; a negative value restores the default budget. */
 void cbm_cypher_test_set_deadline_ms(int64_t budget_ms);
+
+/* Worst-case binding slot count for a node cross-join. Computes the count in
+ * size_t and rejects any that would not fit the int binding counter or would
+ * overflow the size_t byte size; returns 0 and writes *out_n on success,
+ * CBM_NOT_FOUND on overflow. Exposed for arithmetic-boundary unit tests. */
+int cbm_cypher_cross_join_alloc(int bind_count, int extra_count, bool opt, size_t *out_n);
 
 #endif /* CBM_CYPHER_H */

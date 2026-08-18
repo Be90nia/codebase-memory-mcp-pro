@@ -22,6 +22,8 @@ set -uo pipefail
 
 RUNNER="${1:?usage: run-tests-parallel.sh <path-to-test-runner> [jobs]}"
 JOBS="${2:-${CBM_TEST_PAR_JOBS:-}}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCHEDULER="$SCRIPT_DIR/run-test-wave.py"
 
 if [ -z "$JOBS" ]; then
     if command -v nproc >/dev/null 2>&1; then
@@ -56,7 +58,33 @@ stamp_windows_build_dir() {
     esac
     local runner_dir_w me norm_out stamp_out reset_out
     runner_dir_w="$(cygpath -w "$(dirname "$RUNNER")")"
-    me="$(whoami | tr -d '\r')"
+    # Qualify the account with its domain. Git Bash resolves `whoami` to
+    # coreutils, which prints a bare name, and icacls resolves a bare name
+    # against the machine first: on a host whose name equals the user's
+    # (COMPUTERNAME=BUILD, user build) the grant lands on an empty principal
+    # (BUILD\) and, combined with /inheritance:r above, locks this script out
+    # of its own log directory.
+    # Identify the account by SID, never by name. icacls resolves a bare name
+    # against the machine first, so a host whose name equals the user's grants
+    # to an empty principal (#1532); and a USERDOMAIN-qualified name is
+    # UNRESOLVABLE on a workgroup machine — "WORKGROUP\test: No mapping between
+    # account names and security IDs was done" — which fails the grant outright
+    # and silently leaves the tree writable by Authenticated Users. A SID has
+    # neither ambiguity, and the SYSTEM/Administrators grants below already use
+    # this form. Name lookup remains only as a fallback where PowerShell is
+    # unavailable.
+    me="$(powershell.exe -NoProfile -NonInteractive -Command \
+        '[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value' 2>/dev/null |
+        tr -d '\r\n')"
+    case "${me}" in
+    S-1-*) me="*${me}" ;;
+    *)
+        me="$(whoami | tr -d '\r')"
+        if [ -n "${USERDOMAIN:-}" ]; then
+            me="${USERDOMAIN}\\${me}"
+        fi
+        ;;
+    esac
     # Normalize FIRST: some runner images stamp EXPLICIT (non-inherited)
     # Authenticated-Users ACEs onto the workspace tree, which /inheritance:r
     # cannot strip and /grant:r does not touch (it replaces only the granted
@@ -86,6 +114,7 @@ stamp_windows_build_dir pre-wave
 
 SUITES_FILE="$LOGDIR/suites.txt"
 RESULTS_FILE="$LOGDIR/results.txt"
+: > "$RESULTS_FILE"
 
 # tr strips the CR that the Windows CRT appends to every stdout line — a
 # suites file with CRLF endings made the runner reject every name
@@ -165,7 +194,19 @@ shard_filter() {
 # deadlines into deterministic failures while an idle machine passes 6/6.
 # They also all rendezvous through the shared per-account runtime namespace,
 # which the quiet tail keeps free of cross-suite admission traffic.
+# extraction carries the wide-flat SCALING-RATIO guard, which grows the input
+# 20x and asserts the time grows ~20x (linear) rather than ~128x (quadratic),
+# with a bound of 40x between them. Contention does not cancel out of that
+# ratio: the 400k-node measurement loses far more to memory pressure and
+# scheduling than the 20k one, so oversubscription inflates the ratio itself.
+# Measured on the Windows arm64 VM: 18.5x alone (passes) vs 53.8x and 55x in
+# the 18-job wave (fails) — reproducible, 3 of 3. The bound is deliberately NOT
+# widened; see the calibration note in tests/test_extraction.c, which records
+# that 40 sits >=2x from both the linear and quadratic signals, so inflating it
+# would move the test toward the very thing it exists to catch. Quiet is the
+# fix, and at ~22s the suite is cheap to run alone.
 SERIAL_SUITES="cli subprocess watcher incremental httpd ui index_resilience mcp \
+    extraction \
     stack_overflow_a stack_overflow_b stack_overflow_c \
     index_supervisor daemon_application daemon_runtime daemon_frontend \
     daemon_bootstrap daemon_ipc"
@@ -192,55 +233,48 @@ shard_filter < "$SER_FILE" > "$SER_FILE.shard" && mv "$SER_FILE.shard" "$SER_FIL
 SHARD_EXPECT="$LOGDIR/suites-shard.txt"
 cat "$PAR_FILE" "$SER_FILE" > "$SHARD_EXPECT"
 NSHARD=$(wc -l < "$SHARD_EXPECT" | tr -d ' ')
+
+# Machine-checkable manifest for CI's cross-shard completeness job: it
+# proves at runtime that the shards of one leg agree on N and on the full
+# suite list, and that the union of their slices IS that list — the guard
+# against a mis-plumbed CBM_TEST_SHARD (two jobs running the same slice
+# passes every per-shard check but silently drops a slice; only a
+# cross-shard view catches it). Written BEFORE any suite runs: the slice is
+# fully determined here, and a red run's manifest is exactly as load-bearing
+# as a green one's — CI uploads it if: always().
+{
+    echo "leg=${CBM_TEST_LEG:-local}"
+    echo "shard=${SHARD_INDEX}/${SHARD_TOTAL}"
+    echo "list_sha256=$(sort "$SUITES_FILE" | { sha256sum 2>/dev/null || shasum -a 256; } | awk '{print $1}')"
+    echo "--- slice ---"
+    cat "$SHARD_EXPECT"
+} > "$LOGDIR/shard-manifest.txt"
 echo "=== parallel test run: $NSHARD of $NSUITES suites (shard ${SHARD_INDEX}/${SHARD_TOTAL}, $(wc -l < "$SER_FILE" | tr -d ' ') serial-tail), $JOBS jobs ==="
 
-export RUNNER LOGDIR RESULTS_FILE
-run_one() {
-    s="$1"
-    t0=$SECONDS
-    # Per-suite wall-clock ceiling so a wedged suite fails LOUDLY instead of
-    # blocking the run (and the single local build slot) indefinitely. The
-    # `incremental` suite legitimately re-indexes large fixtures (minutes) so
-    # it gets a wider ceiling until the template-DB fixture refactor lands;
-    # `daemon_runtime` measures ~610s SOLO on arm64 under ASan (10-round
-    # loop), so on an overloaded 4-job CI runner the 900s default is a
-    # slowness kill, not a hang detector — it joins the slow tier.
-    # Uses `timeout` where available (always in the Linux container / CI); on a
-    # host without it the suite runs uncapped (no regression vs before).
-    case "$s" in
-        incremental | store_arch | daemon_runtime) st="${CBM_SUITE_TIMEOUT_SLOW:-3600}" ;;
-        *) st="${CBM_SUITE_TIMEOUT:-900}" ;;
-    esac
-    if command -v timeout >/dev/null 2>&1; then
-        timeout --kill-after=15 "$st" "$RUNNER" "$s" > "$LOGDIR/$s.log" 2>&1
-        rc=$?
-        if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
-            echo "  FAIL: suite '$s' exceeded ${st}s wall clock (killed as hung)" \
-                >> "$LOGDIR/$s.log"
-        fi
-    else
-        "$RUNNER" "$s" > "$LOGDIR/$s.log" 2>&1
-        rc=$?
+# Per-suite wall-clock ceilings make a wedged child fail loudly. The
+# `incremental` suite legitimately re-indexes large fixtures (minutes), while
+# `daemon_runtime` measures ~610s solo on arm64 under ASan; those and
+# `store_arch` receive the wider ceiling. Process ownership and result
+# accounting live in one Python parent — no exported MSYS bash worker remains
+# between a completed native child and its durable result line.
+run_wave() {
+    local suite_file="$1"
+    local jobs="$2"
+    if ! python3 "$SCHEDULER" \
+        --suite-file "$suite_file" \
+        --log-dir "$LOGDIR" \
+        --results-file "$RESULTS_FILE" \
+        --jobs "$jobs" \
+        --timeout "${CBM_SUITE_TIMEOUT:-900}" \
+        --slow-timeout "${CBM_SUITE_TIMEOUT_SLOW:-3600}" \
+        --kill-grace 15 \
+        "$RUNNER"; then
+        echo "FAIL: parallel suite scheduler infrastructure failed" >&2
+        exit 1
     fi
-    secs=$((SECONDS - t0))
-    summary=$(grep -E '^  [0-9]+ passed' "$LOGDIR/$s.log" | tail -1)
-    # A suite that exits 0 WITHOUT printing its completion summary ran zero
-    # tests as far as anyone can prove (mis-parsed argv, drifted registration
-    # macro, early return) — that is a failure, not a green with pass=0.
-    if [ "$rc" -eq 0 ] && [ -z "$summary" ]; then
-        rc=97
-        echo "  FAIL: suite '$s' exited 0 without a completion summary (ran nothing?)" \
-            >> "$LOGDIR/$s.log"
-    fi
-    pass=$(printf '%s' "$summary" | sed -n 's/^  \([0-9]*\) passed.*/\1/p')
-    failn=$(printf '%s' "$summary" | sed -n 's/.* \([0-9]*\) failed.*/\1/p')
-    skip=$(printf '%s' "$summary" | sed -n 's/.* \([0-9]*\) skipped.*/\1/p')
-    # A single short echo line is an atomic append (< PIPE_BUF).
-    echo "$s rc=$rc pass=${pass:-0} fail=${failn:-0} skip=${skip:-0} secs=$secs" >> "$RESULTS_FILE"
 }
-export -f run_one
 
-xargs -P "$JOBS" -I{} bash -c 'run_one "$@"' _ {} < "$PAR_FILE"
+run_wave "$PAR_FILE" "$JOBS"
 
 # Tail scheduling in two phases. The FLEX suites are timing-shaped but do
 # not rendezvous through the shared per-account daemon runtime namespace,
@@ -249,8 +283,13 @@ xargs -P "$JOBS" -I{} bash -c 'run_one "$@"' _ {} < "$PAR_FILE"
 # time on an idle machine. The EXCL group (daemon-family plus the suites
 # that drive daemon one-shots or supervisor rendezvous) then runs strictly
 # sequentially on a machine exactly as quiet as the old tail gave it.
+# extraction is in this group for a DIFFERENT reason than the rest: it does not
+# rendezvous through the daemon namespace, it measures a scaling ratio, and even
+# the FLEX group's small fixed overlap is load the measurement would absorb.
+# Strictly sequential is what makes its verdict a function of the code instead
+# of the scheduler.
 TAIL_EXCL="cli mcp index_supervisor daemon_application daemon_runtime \
-    daemon_frontend daemon_bootstrap daemon_ipc"
+    daemon_frontend daemon_bootstrap daemon_ipc extraction"
 is_tail_excl() {
     case " $TAIL_EXCL " in *" $1 "*) return 0 ;; *) return 1 ;; esac
 }
@@ -272,24 +311,8 @@ done < "$SER_FILE"
 # Re-stamp at the tail boundary so the deadline-sensitive tail — which
 # hosts those suites — always starts from the verified-clean shape.
 stamp_windows_build_dir pre-tail
-xargs -P "${CBM_TAIL_JOBS:-2}" -I{} bash -c 'run_one "$@"' _ {} < "$FLEX_FILE"
-while IFS= read -r sname; do
-    run_one "$sname"
-done < "$EXCL_FILE"
-
-# Machine-checkable manifest for CI's cross-shard completeness job: it
-# proves at runtime that the shards of one leg agree on N and on the full
-# suite list, and that the union of their slices IS that list — the guard
-# against a mis-plumbed CBM_TEST_SHARD (two jobs running the same slice
-# passes every per-shard check but silently drops a slice; only a
-# cross-shard view catches it).
-{
-    echo "leg=${CBM_TEST_LEG:-local}"
-    echo "shard=${SHARD_INDEX}/${SHARD_TOTAL}"
-    echo "list_sha256=$(sort "$SUITES_FILE" | { sha256sum 2>/dev/null || shasum -a 256; } | awk '{print $1}')"
-    echo "--- slice ---"
-    cat "$SHARD_EXPECT"
-} > "$LOGDIR/shard-manifest.txt"
+run_wave "$FLEX_FILE" "${CBM_TAIL_JOBS:-2}"
+run_wave "$EXCL_FILE" 1
 
 # ── Union guard: every suite in this shard's slice produced exactly one
 # result. The slice is deterministic, so N green shard jobs = full coverage;
