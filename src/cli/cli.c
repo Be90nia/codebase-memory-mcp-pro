@@ -1,4 +1,4 @@
-﻿/*
+/*
  * cli.c — CLI subcommand handlers for install, uninstall, update, version.
  *
  * Port of Go cmd/codebase-memory-mcp/ install/update logic.

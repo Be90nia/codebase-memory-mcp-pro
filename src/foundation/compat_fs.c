@@ -1540,7 +1540,6 @@ int cbm_spawn_capture_validated(const char *exe, const char *const *argv, char *
     return 0;
 }
 
-
 /* ── Clone-or-copy ───────────────────────────────────────────────── */
 
 #if defined(__APPLE__)
