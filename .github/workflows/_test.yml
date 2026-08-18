@@ -250,6 +250,12 @@ jobs:
       - name: Test (clang-22, ASan+UBSan + off-by-default ASan checks)
         env:
           ASAN_OPTIONS: "detect_stack_use_after_return=1:strict_string_checks=1:detect_stack_use_after_scope=1"
+          # The incremental suite (SLOW_SUITES in scripts/run-test-wave.py) runs
+          # ~3500s in this lane in this fork vs ~2470s upstream — the default
+          # 3600s slow-suite budget left ~3% headroom and runner variance
+          # tipped it over (killed mid-suite as hung). 5400s fits the job's
+          # 120-minute timeout with room for the rest of the wave.
+          CBM_SUITE_TIMEOUT_SLOW: "5400"
         run: |
           scripts/test.sh CC=clang-22 CXX=clang++-22 \
             SANITIZE="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-optimize-sibling-calls"

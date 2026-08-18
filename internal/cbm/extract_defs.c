@@ -4324,14 +4324,21 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         }
     }
     // Swift: tree-sitter-swift does NOT have a dedicated `struct_declaration`
-    // node — `struct`, `class`, `enum` and `actor` all parse to
+    // node — `struct`, `class`, `enum`, `actor` and `extension` all parse to
     // `class_declaration`, distinguished only by the `declaration_kind` field
-    // (the leading keyword token). Read that field and emit the idiomatic label
-    // (struct→Struct, enum→Enum, actor→Actor; class stays "Class", which
-    // class_label_for_kind already gives). "Struct"/"Enum"/"Actor" are type-like
-    // containers: every type-resolution / registry / IMPLEMENTS consumer routes
-    // through cbm_label_is_type_like(), so resolution is unaffected. Scoped to
-    // Swift only. (WS2b, codegraph parity)
+    // (the leading keyword token). struct/enum/actor get the idiomatic label
+    // (→Struct/Enum/Actor; class stays "Class", which class_label_for_kind
+    // already gives). Those are type-like containers: every type-resolution /
+    // registry / IMPLEMENTS consumer routes through cbm_label_is_type_like(),
+    // so resolution is unaffected. Scoped to Swift only. (WS2b, codegraph parity)
+    //
+    // `extension X` is the special case: its `name` IS the extended type, so the
+    // FQN it would emit is the real type's FQN. Pushing a type def here would
+    // CLOBBER the real type's label via the UNIQUE(project,qualified_name)
+    // last-write-wins upsert (e.g. `struct X{}` then `extension X:P{}` relabels
+    // X back to "Class") and phantom-node a type defined elsewhere. Extract its
+    // members (they attach to the extended type's QN) but emit NO type def for
+    // the extension itself. (WS2b review fix)
     if (ctx->language == CBM_LANG_SWIFT && strcmp(kind, "class_declaration") == 0) {
         TSNode dk = ts_node_child_by_field_name(node, TS_FIELD("declaration_kind"));
         char *dk_text = ts_node_is_null(dk) ? NULL : cbm_node_text(a, dk, ctx->source);
@@ -4342,25 +4349,12 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
                 label = "Enum";
             } else if (strcmp(dk_text, "actor") == 0) {
                 label = "Actor";
+            } else if (strcmp(dk_text, "extension") == 0) {
+                extract_class_methods(ctx, node, class_qn, spec);
+                extract_class_fields(ctx, node, class_qn, spec);
+                extract_class_variables(ctx, node, class_qn, spec);
+                return;
             }
-        }
-    }
-    // Swift `extension X` also parses to `class_declaration` with
-    // declaration_kind="extension", and its `name` IS the extended type — the
-    // FQN it would emit is the real type's FQN. Pushing a type def here would
-    // CLOBBER the real type's label via the UNIQUE(project,qualified_name)
-    // last-write-wins upsert (e.g. `struct X{}` then `extension X:P{}` relabels
-    // X back to "Class") and phantom-node a type defined elsewhere. Extract its
-    // members (they attach to the extended type's QN) but emit NO type def for
-    // the extension itself. (WS2b review fix)
-    if (ctx->language == CBM_LANG_SWIFT && strcmp(kind, "class_declaration") == 0) {
-        TSNode dk = ts_node_child_by_field_name(node, TS_FIELD("declaration_kind"));
-        char *dk_text = ts_node_is_null(dk) ? NULL : cbm_node_text(a, dk, ctx->source);
-        if (dk_text && strcmp(dk_text, "extension") == 0) {
-            extract_class_methods(ctx, node, class_qn, spec);
-            extract_class_fields(ctx, node, class_qn, spec);
-            extract_class_variables(ctx, node, class_qn, spec);
-            return;
         }
     }
     // F#: a `type_definition` that has a primary constructor (`type Foo(...) =`)
