@@ -27,10 +27,11 @@
 #include "test_helpers.h"
 #include "git/git_context.h"
 
-#ifndef __has_feature
-#define __has_feature(x) 0
-#endif
-#if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
+#include "../src/foundation/sanitized.h"
+/* Historical name; widened from ASan-only to every sanitizer (CBM_SANITIZED):
+ * MSan/TSan children deadlock on shadow-map inheritance across fork just the
+ * same, so the fork-based tests below skip under any sanitizer. */
+#if CBM_SANITIZED
 #define CBM_ASAN_ACTIVE 1
 #else
 #define CBM_ASAN_ACTIVE 0

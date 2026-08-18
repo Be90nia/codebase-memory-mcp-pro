@@ -1,5 +1,6 @@
-# 手动触发：一次性构建所有平台二进制
-# 直接复用上游的 _build.yml reusable workflow（fork 完整继承），零定制、零 secrets。
+# Manual trigger: build binaries for all platforms in one run.
+# Reuses the upstream _build.yml reusable workflow verbatim (inherited by the
+# fork); zero customization, zero secrets.
 name: Build All Platforms
 
 on:
@@ -7,8 +8,8 @@ on:
 
 permissions:
   contents: read
-  id-token: write      # 必须授予 reusable workflow (_build.yml) 声明的权限
-  attestations: write  # GitHub Actions 强制 callee permissions 是 caller 子集
+  id-token: write      # required: must grant what _build.yml (callee) declares
+  attestations: write  # GitHub Actions requires callee perms to be a caller subset
 
 jobs:
   build:

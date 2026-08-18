@@ -4324,17 +4324,43 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         }
     }
     // Swift: tree-sitter-swift does NOT have a dedicated `struct_declaration`
-    // node — `struct`, `class` and `actor` all parse to `class_declaration`,
-    // distinguished only by the `declaration_kind` field (the leading keyword
-    // token). Read that field and emit "Struct" when the keyword is `struct`
-    // (and "Class" for `class`/`actor`, which class_label_for_kind already gives).
+    // node — `struct`, `class`, `enum` and `actor` all parse to
+    // `class_declaration`, distinguished only by the `declaration_kind` field
+    // (the leading keyword token). Read that field and emit the idiomatic label
+    // (struct→Struct, enum→Enum, actor→Actor; class stays "Class", which
+    // class_label_for_kind already gives). "Struct"/"Enum"/"Actor" are type-like
+    // containers: every type-resolution / registry / IMPLEMENTS consumer routes
+    // through cbm_label_is_type_like(), so resolution is unaffected. Scoped to
+    // Swift only. (WS2b, codegraph parity)
     if (ctx->language == CBM_LANG_SWIFT && strcmp(kind, "class_declaration") == 0) {
         TSNode dk = ts_node_child_by_field_name(node, TS_FIELD("declaration_kind"));
-        if (!ts_node_is_null(dk)) {
-            char *dk_text = cbm_node_text(a, dk, ctx->source);
-            if (dk_text && strcmp(dk_text, "struct") == 0) {
+        char *dk_text = ts_node_is_null(dk) ? NULL : cbm_node_text(a, dk, ctx->source);
+        if (dk_text) {
+            if (strcmp(dk_text, "struct") == 0) {
                 label = "Struct";
+            } else if (strcmp(dk_text, "enum") == 0) {
+                label = "Enum";
+            } else if (strcmp(dk_text, "actor") == 0) {
+                label = "Actor";
             }
+        }
+    }
+    // Swift `extension X` also parses to `class_declaration` with
+    // declaration_kind="extension", and its `name` IS the extended type — the
+    // FQN it would emit is the real type's FQN. Pushing a type def here would
+    // CLOBBER the real type's label via the UNIQUE(project,qualified_name)
+    // last-write-wins upsert (e.g. `struct X{}` then `extension X:P{}` relabels
+    // X back to "Class") and phantom-node a type defined elsewhere. Extract its
+    // members (they attach to the extended type's QN) but emit NO type def for
+    // the extension itself. (WS2b review fix)
+    if (ctx->language == CBM_LANG_SWIFT && strcmp(kind, "class_declaration") == 0) {
+        TSNode dk = ts_node_child_by_field_name(node, TS_FIELD("declaration_kind"));
+        char *dk_text = ts_node_is_null(dk) ? NULL : cbm_node_text(a, dk, ctx->source);
+        if (dk_text && strcmp(dk_text, "extension") == 0) {
+            extract_class_methods(ctx, node, class_qn, spec);
+            extract_class_fields(ctx, node, class_qn, spec);
+            extract_class_variables(ctx, node, class_qn, spec);
+            return;
         }
     }
     // F#: a `type_definition` that has a primary constructor (`type Foo(...) =`)
@@ -5219,7 +5245,9 @@ static void extract_csharp_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
 static bool is_enum_member_kind(const char *kind) {
     return strcmp(kind, "enum_member_declaration") == 0 || strcmp(kind, "enum_constant") == 0 ||
            strcmp(kind, "enum_member") == 0 || strcmp(kind, "enum_assignment") == 0 ||
-           strcmp(kind, "enumerator") == 0;
+           strcmp(kind, "enumerator") == 0 ||
+           /* Swift & Kotlin enum cases (the ONLY grammars that use `enum_entry`). */
+           strcmp(kind, "enum_entry") == 0;
 }
 
 /* Extract enum members as Variable nodes (C#, Java, TypeScript, C++). */
@@ -5229,10 +5257,42 @@ static void extract_enum_members(CBMExtractCtx *ctx, TSNode node, const char *cl
     if (ts_node_is_null(body)) {
         return;
     }
+    bool swiftish = (ctx->language == CBM_LANG_SWIFT || ctx->language == CBM_LANG_KOTLIN);
     uint32_t mc = ts_node_named_child_count(body);
     for (uint32_t mi = 0; mi < mc; mi++) {
         TSNode member = ts_node_named_child(body, mi);
         if (!is_enum_member_kind(ts_node_type(member))) {
+            continue;
+        }
+        /* Swift/Kotlin: one `enum_entry` may declare several comma-separated case
+         * names (`case a, b, c`). Each case identifier is a DIRECT
+         * `simple_identifier` child; associated-value types (`case foo(Int)`)
+         * and raw values (`= 1`) are nested / non-identifier children, so
+         * iterating direct simple_identifier children yields exactly the case
+         * names. Emit one EnumCase per name — a distinct kind from Variable
+         * (codegraph parity; cases were previously dropped entirely because
+         * `enum_entry` was not a recognized member kind). (M2-c) */
+        if (swiftish && strcmp(ts_node_type(member), "enum_entry") == 0) {
+            uint32_t cc = ts_node_named_child_count(member);
+            for (uint32_t ci = 0; ci < cc; ci++) {
+                TSNode cn = ts_node_named_child(member, ci);
+                if (strcmp(ts_node_type(cn), "simple_identifier") != 0) {
+                    continue;
+                }
+                char *case_name = cbm_node_text(a, cn, ctx->source);
+                if (!case_name || !case_name[0]) {
+                    continue;
+                }
+                CBMDefinition cdef;
+                memset(&cdef, 0, sizeof(cdef));
+                cdef.name = case_name;
+                cdef.qualified_name = cbm_arena_sprintf(a, "%s.%s", class_qn, case_name);
+                cdef.label = "EnumCase";
+                cdef.file_path = ctx->rel_path;
+                cdef.start_line = ts_node_start_point(cn).row + TS_LINE_OFFSET;
+                cdef.end_line = ts_node_end_point(member).row + TS_LINE_OFFSET;
+                cbm_defs_push(&ctx->result->defs, a, cdef);
+            }
             continue;
         }
         TSNode mname = ts_node_child_by_field_name(member, TS_FIELD("name"));
