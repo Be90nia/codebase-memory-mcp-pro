@@ -50,6 +50,10 @@ on:
         type: choice
         options: ['full', 'quick', 'none']
         default: 'quick'
+      version:
+        description: 'Version string passed to the build (e.g. v0.10.6); empty = dev'
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -67,8 +71,6 @@ jobs:
 
   # ── Tests (all platforms, perf tests skipped on CI) ────────────
   test:
-    needs: [lint]
-    if: ${{ inputs.skip_tests != true && !cancelled() && (needs.lint.result == 'success' || needs.lint.result == 'skipped') }}
     uses: ./.github/workflows/_test.yml
     with:
       skip_perf: true
@@ -85,6 +87,7 @@ jobs:
       attestations: write
     uses: ./.github/workflows/_build.yml
     with:
+      version: ${{ inputs.version }}
       attest: false
       scan_candidates: ${{ !inputs.skip_virustotal }}
     secrets: inherit
