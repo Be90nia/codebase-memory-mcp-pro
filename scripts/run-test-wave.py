@@ -27,6 +27,11 @@ FAILED = re.compile(r"(?:^|, )(?P<failed>[0-9]+) failed")
 SKIPPED = re.compile(r"(?:^|, )(?P<skipped>[0-9]+) skipped")
 SLOW_SUITES = frozenset(("incremental", "store_arch", "daemon_runtime"))
 POLL_SECONDS = 0.05
+# Budget for invoking the native proof tools themselves (taskkill, powershell).
+# A kill grace bounds a dying process, not a tool cold start: freshly
+# provisioned Windows runners can take seconds to first-launch these
+# binaries under install churn, which must not fail the cleanup proof.
+TOOL_QUERY_SECONDS = 30
 
 
 @dataclass
@@ -123,7 +128,7 @@ def start_suite(
     )
 
 
-def windows_descendants(pid: int, timeout: int) -> bool:
+def windows_descendants(pid: int) -> bool:
     """True if any live process still claims `pid` as its parent.
 
     Used only when the suite leader has already exited: `taskkill /T` cannot
@@ -132,28 +137,32 @@ def windows_descendants(pid: int, timeout: int) -> bool:
     reparent orphans, so a grandchild keeps pointing at its own (dead) parent
     and would not be found here. That is a weaker proof than taskkill /T, which
     is why it is reserved for the case where the strong proof is impossible.
+    A tool failure is retried once before assuming the worst, so a slow
+    powershell cold start cannot fake live descendants.
     """
-    try:
-        completed = subprocess.run(
-            [
-                "powershell.exe",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "@(Get-CimInstance Win32_Process -Filter "
-                f"'ParentProcessId={pid}').Count",
-            ],
-            check=False,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return True  # cannot prove absence -> assume the worst
-    if completed.returncode != 0:
-        return True
-    return (completed.stdout or "").strip() not in ("0", "")
+    for _ in range(2):
+        try:
+            completed = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "@(Get-CimInstance Win32_Process -Filter "
+                    f"'ParentProcessId={pid}').Count",
+                ],
+                check=False,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=TOOL_QUERY_SECONDS,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if completed.returncode != 0:
+            continue
+        return (completed.stdout or "").strip() not in ("0", "")
+    return True  # cannot prove absence after a retry -> assume the worst
 
 
 def terminate_process_tree(active: ActiveSuite, kill_grace: int) -> None:
@@ -167,7 +176,7 @@ def terminate_process_tree(active: ActiveSuite, kill_grace: int) -> None:
             # how a deliberately-hanging fixture suite reddened a release run.
             # taskkill /T cannot walk a tree from a dead PID, so prove cleanup
             # the only way still available -- nothing is parented to it.
-            if windows_descendants(process.pid, kill_grace):
+            if windows_descendants(process.pid):
                 raise RuntimeError(
                     f"suite {active.name!r} leader exited leaving live descendants"
                 )
@@ -185,7 +194,7 @@ def terminate_process_tree(active: ActiveSuite, kill_grace: int) -> None:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=kill_grace,
+                timeout=TOOL_QUERY_SECONDS,
             )
         except (OSError, subprocess.TimeoutExpired):
             completed = None
