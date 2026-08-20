@@ -51,7 +51,7 @@ on:
         options: ['full', 'quick', 'none']
         default: 'quick'
       version:
-        description: 'Version string passed to the build (e.g. v0.10.6); empty = dev'
+        description: 'Version string passed to the build (e.g. v0.10.9); empty = dev'
         type: string
         default: ''
 

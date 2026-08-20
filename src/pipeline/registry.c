@@ -25,6 +25,7 @@ enum { REG_MAX_CANDIDATES = 256 };
 
 #define DEFAULT_CONFIDENCE 0.5
 #include "pipeline/pipeline.h"
+#include "cbm.h"               /* cbm_label_is_relation — the resolve-time relation veto */
 #include "foundation/compat.h" /* CBM_TLS */
 #include "foundation/hash_table.h"
 #include "foundation/dyn_array.h"
@@ -662,11 +663,12 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
      * resolved.requireAdmin — not just resolved, which would point at the
      * module node and miss the function entirely. */
     /* Direct hit ONLY for suffix-less callees (an aliased direct-symbol
-     * import called bare: `from m import f as g; g()` — #875/#979). With a
-     * suffix present (`imported.method()`), returning the bare base here
-     * would swallow the suffix and bind the call to the imported symbol's
-     * own node (a Variable/Class/module) instead of base.method — exactly
-     * the mis-resolution the comment above warns about. That regressed
+     * import called bare: `from m import f as g; g()` — #875/#979; Yui
+     * `import execute as bridge_execute`). With a suffix present
+     * (`imported.method()`), returning the bare base here would swallow
+     * the suffix and bind the call to the imported symbol's own node
+     * (a Variable/Class/module) instead of base.method — exactly the
+     * mis-resolution the comment above warns about. That regressed
      * django-scale graphs by ~11K CALLS/TESTS edges (Signal.send calls
      * degraded to edges onto the signal variables themselves). #1000 */
     if (!suffix || !suffix[0]) {
@@ -867,24 +869,11 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
     return empty_result();
 }
 
-cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *callee_name,
-                                      const char *module_qn, const char **import_map_keys,
-                                      const char **import_map_vals, int import_map_count) {
-    if (!r || !callee_name) {
-        return empty_result();
-    }
-
-    /* Per-file cache: same callee_name in N call sites → 1 chain walk
-     * + N-1 O(1) hash hits. module_qn is constant per file so the
-     * cache key only needs callee_name. */
-    if (_resolve_cache) {
-        resolve_cache_entry_t *cached =
-            (resolve_cache_entry_t *)cbm_ht_get(_resolve_cache, callee_name);
-        if (cached) {
-            return cached->res;
-        }
-    }
-
+/* The strategy chain shared by both public resolve variants (no caching here —
+ * cbm_registry_resolve owns the per-file cache). */
+static cbm_resolution_t registry_resolve_chain(const cbm_registry_t *r, const char *callee_name,
+                                               const char *module_qn, const char **import_map_keys,
+                                               const char **import_map_vals, int import_map_count) {
     /* Split callee at the first path separator: "pkg.Func" → prefix="pkg",
      * suffix="Func".  Rust/C++ use "::" rather than ".", so honor whichever
      * separator appears first ("lib::square" → prefix="lib", suffix="square").
@@ -923,6 +912,41 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
         /* Strategy 3+4: name lookup */
         res = resolve_name_lookup(r, callee_name, module_qn, import_map_vals, import_map_count);
     }
+    return res;
+}
+
+cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *callee_name,
+                                      const char *module_qn, const char **import_map_keys,
+                                      const char **import_map_vals, int import_map_count) {
+    if (!r || !callee_name) {
+        return empty_result();
+    }
+
+    /* Per-file cache: same callee_name in N call sites → 1 chain walk
+     * + N-1 O(1) hash hits. module_qn is constant per file so the
+     * cache key only needs callee_name. */
+    if (_resolve_cache) {
+        resolve_cache_entry_t *cached =
+            (resolve_cache_entry_t *)cbm_ht_get(_resolve_cache, callee_name);
+        if (cached) {
+            return cached->res;
+        }
+    }
+
+    cbm_resolution_t res = registry_resolve_chain(r, callee_name, module_qn, import_map_keys,
+                                                  import_map_vals, import_map_count);
+
+    /* Data relations (Table/View) are lineage-only registry members: common
+     * table names (users, orders, config) collide with code identifiers across
+     * every language, so the DEFAULT resolve never returns them — a veto, not a
+     * re-route, so a name-collision does not fall through to a weaker strategy.
+     * Every consumer (CALLS/USAGE/READS/WRITES/THROWS/handlers/decorators,
+     * present and future) is thereby relation-safe by construction. The SQL
+     * lineage path opts in via cbm_registry_resolve_lineage. */
+    if (res.qualified_name && res.qualified_name[0] &&
+        cbm_label_is_relation(cbm_registry_label_of(r, res.qualified_name))) {
+        res = empty_result();
+    }
 
     /* Cache the result (including empty — caching the negative answer
      * is just as valuable; same name asks the same question). */
@@ -939,6 +963,21 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
         }
     }
     return res;
+}
+
+cbm_resolution_t cbm_registry_resolve_lineage(const cbm_registry_t *r, const char *callee_name,
+                                              const char *module_qn, const char **import_map_keys,
+                                              const char **import_map_vals, int import_map_count) {
+    if (!r || !callee_name) {
+        return empty_result();
+    }
+    /* Relation-permitting variant for SQL FROM/JOIN lineage usages ONLY.
+     * Deliberately uncached: the per-file cache is keyed by bare callee_name
+     * and stores the relation-vetoed answer of the default variant — sharing
+     * it would poison one variant with the other's semantics. SQL files hold
+     * few distinct relation refs, so the chain walk stays cheap. */
+    return registry_resolve_chain(r, callee_name, module_qn, import_map_keys, import_map_vals,
+                                  import_map_count);
 }
 
 /* ── Fuzzy Resolve ──────────────────────────────────────────────── */
