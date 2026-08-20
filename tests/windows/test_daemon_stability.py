@@ -360,7 +360,7 @@ def section_cold_storm(binary, work):
     for index, result in enumerate(results):
         if result is None or result.returncode != 0:
             print("RED: cold-storm client %d failed (racing daemon spawn):\n%s"
-                  % (index, out_text(result)[:300] if result else "(no result)"))
+                  % (index, out_text(result)[:3000] if result else "(no result)"))
             return False
     if not wait_status_not_running(binary, cache, 90):
         print("RED: the ephemeral daemon shared by the cold storm never retired")
