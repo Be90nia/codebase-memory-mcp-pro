@@ -22,7 +22,7 @@ describe("App", () => {
 
   it("shows the serving binary version", async () => {
     vi.stubGlobal("fetch", vi.fn(async () =>
-      new Response(JSON.stringify({ lang: "en", version: "0.10.8" }), {
+      new Response(JSON.stringify({ lang: "en", version: "0.11.1" }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
       }),
@@ -30,7 +30,7 @@ describe("App", () => {
 
     render(<App />);
 
-    expect(await screen.findByText("v0.10.8")).toBeVisible();
+    expect(await screen.findByText("v0.11.1")).toBeVisible();
   });
 
   it("hides the version when the config has no string version", async () => {
