@@ -1,17 +1,17 @@
 # codebase-memory-mcp
 
-[![GitHub Release](https://img.shields.io/github/v/release/DeusData/codebase-memory-mcp?style=flat&color=blue)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
+[![GitHub Release](https://img.shields.io/github/v/release/Be90nia/codebase-memory-mcp-pro?style=flat&color=blue)](https://github.com/Be90nia/codebase-memory-mcp-pro/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![CI](https://img.shields.io/github/actions/workflow/status/DeusData/codebase-memory-mcp/dry-run.yml?label=CI)](https://github.com/DeusData/codebase-memory-mcp/actions/workflows/dry-run.yml)
-[![Tests](https://img.shields.io/badge/tests-6768_passing-brightgreen)](https://github.com/DeusData/codebase-memory-mcp)
-[![Languages](https://img.shields.io/badge/languages-162-orange)](https://github.com/DeusData/codebase-memory-mcp)
+[![CI](https://img.shields.io/github/actions/workflow/status/Be90nia/codebase-memory-mcp-pro/dry-run.yml?label=CI)](https://github.com/Be90nia/codebase-memory-mcp-pro/actions/workflows/dry-run.yml)
+[![Tests](https://img.shields.io/badge/tests-6768_passing-brightgreen)](https://github.com/Be90nia/codebase-memory-mcp-pro)
+[![Languages](https://img.shields.io/badge/languages-162-orange)](https://github.com/Be90nia/codebase-memory-mcp-pro)
 [![Hybrid LSP](https://img.shields.io/badge/Hybrid_LSP-10_languages-blue)](#hybrid-lsp)
-[![Agents](https://img.shields.io/badge/agent_surfaces-45-purple)](https://github.com/DeusData/codebase-memory-mcp)
-[![Pure C](https://img.shields.io/badge/pure_C-no_language_runtime-blue)](https://github.com/DeusData/codebase-memory-mcp)
-[![Platform](https://img.shields.io/badge/macOS_%7C_Linux_%7C_Windows-supported-lightgrey)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/DeusData/codebase-memory-mcp/badge)](https://scorecard.dev/viewer/?uri=github.com/DeusData/codebase-memory-mcp)
+[![Agents](https://img.shields.io/badge/agent_surfaces-45-purple)](https://github.com/Be90nia/codebase-memory-mcp-pro)
+[![Pure C](https://img.shields.io/badge/pure_C-no_language_runtime-blue)](https://github.com/Be90nia/codebase-memory-mcp-pro)
+[![Platform](https://img.shields.io/badge/macOS_%7C_Linux_%7C_Windows-supported-lightgrey)](https://github.com/Be90nia/codebase-memory-mcp-pro/releases/latest)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/Be90nia/codebase-memory-mcp-pro/badge)](https://scorecard.dev/viewer/?uri=github.com/Be90nia/codebase-memory-mcp-pro)
 [![SLSA 3](https://slsa.dev/images/gh-badge-level3.svg)](https://slsa.dev)
-[![VirusTotal](https://img.shields.io/badge/VirusTotal-scanned_every_release-brightgreen?logo=virustotal)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
+[![VirusTotal](https://img.shields.io/badge/VirusTotal-scanned_every_release-brightgreen?logo=virustotal)](https://github.com/Be90nia/codebase-memory-mcp-pro/releases/latest)
 [![arXiv](https://img.shields.io/badge/arXiv-2603.27277-b31b1b?logo=arxiv)](https://arxiv.org/abs/2603.27277)
 
 **The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. Ships as a native executable with a small verified runtime-asset set for macOS, Linux, and Windows — download, run `install`, done.
@@ -20,7 +20,7 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 
 > **Research** — The design and benchmarks behind this project are described in the preprint [*Codebase-Memory: Tree-Sitter-Based Knowledge Graphs for LLM Code Exploration via MCP*](https://arxiv.org/abs/2603.27277) (arXiv:2603.27277). Evaluated across 31 real-world repositories: 83% answer quality, 10× fewer tokens, 2.1× fewer tool calls vs. file-by-file exploration.
 
-> **Security & Trust** — This tool reads your codebase and writes to your agent configuration files. That is what it is designed to do. If you prefer to audit before running, the [full source is here](https://github.com/DeusData/codebase-memory-mcp). For each release product, three behaviourally identical executable candidates (unstripped, debug-stripped, stripped) are submitted to VirusTotal before testing; the selected candidate is then packaged with its SHA-256 unchanged. Release notes link every measured candidate result. Publication permits only the narrowly documented single-Microsoft `!ml` tolerance in [SECURITY.md](SECURITY.md#our-release-policy). All processing happens 100% locally; your code never leaves your machine. Found a security issue? We want to know — see [SECURITY.md](SECURITY.md). Security is Priority #1 for us.
+> **Security & Trust** — This tool reads your codebase and writes to your agent configuration files. That is what it is designed to do. If you prefer to audit before running, the [full source is here](https://github.com/Be90nia/codebase-memory-mcp-pro). For each release product, three behaviourally identical executable candidates (unstripped, debug-stripped, stripped) are submitted to VirusTotal before testing; the selected candidate is then packaged with its SHA-256 unchanged. Release notes link every measured candidate result. Publication permits only the narrowly documented single-Microsoft `!ml` tolerance in [SECURITY.md](SECURITY.md#our-release-policy). All processing happens 100% locally; your code never leaves your machine. Found a security issue? We want to know — see [SECURITY.md](SECURITY.md). Security is Priority #1 for us.
 
 <p align="center">
   <img src="docs/graph-ui-screenshot.png" alt="Graph visualization UI showing the codebase-memory-mcp knowledge graph" width="800">
@@ -43,18 +43,18 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 
 **One-line install** (macOS / Linux):
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Be90nia/codebase-memory-mcp-pro/main/install.sh | bash
 ```
 
 With graph visualization UI:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Be90nia/codebase-memory-mcp-pro/main/install.sh | bash
 ```
 
 **Windows** (PowerShell):
 ```powershell
 # 1. Download the installer
-Invoke-WebRequest -Uri https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.ps1 -OutFile install.ps1
+Invoke-WebRequest -Uri https://raw.githubusercontent.com/Be90nia/codebase-memory-mcp-pro/main/install.ps1 -OutFile install.ps1
 
 # 2. (Optional but recommended) Inspect the script
 notepad install.ps1
@@ -84,7 +84,7 @@ Restart your coding agent. Say **"Index this project"** — done.
 <details>
 <summary>Manual install</summary>
 
-1. **Download** the archive for your platform from the [latest release](https://github.com/DeusData/codebase-memory-mcp/releases/latest):
+1. **Download** the archive for your platform from the [latest release](https://github.com/Be90nia/codebase-memory-mcp-pro/releases/latest):
    - `codebase-memory-mcp-<os>-<arch>.tar.gz` (macOS/Linux) or `.zip` (Windows)
 
 2. **Extract and install** (each archive includes `install.sh` or `install.ps1`):
@@ -340,13 +340,13 @@ Every release includes `checksums.txt` with SHA-256 hashes. The executable is se
 **macOS / Linux:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/scripts/setup.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Be90nia/codebase-memory-mcp-pro/main/scripts/setup.sh | bash
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-irm https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/scripts/setup-windows.ps1 | iex
+irm https://raw.githubusercontent.com/Be90nia/codebase-memory-mcp-pro/main/scripts/setup-windows.ps1 | iex
 ```
 
 </details>
@@ -377,18 +377,18 @@ Run directly without installing:
 
 ```bash
 # Standard server
-nix run github:DeusData/codebase-memory-mcp
+nix run github:Be90nia/codebase-memory-mcp-pro
 
 # Server with the embedded graph UI
-nix run github:DeusData/codebase-memory-mcp#codebase-memory-mcp-ui -- --ui=true --port=9749
+nix run github:Be90nia/codebase-memory-mcp-pro#codebase-memory-mcp-ui -- --ui=true --port=9749
 # then open http://127.0.0.1:9749
 ```
 
 Or build a binary into `./result/bin/codebase-memory-mcp`:
 
 ```bash
-nix build github:DeusData/codebase-memory-mcp                          # standard
-nix build github:DeusData/codebase-memory-mcp#codebase-memory-mcp-ui   # with UI
+nix build github:Be90nia/codebase-memory-mcp-pro                          # standard
+nix build github:Be90nia/codebase-memory-mcp-pro#codebase-memory-mcp-ui   # with UI
 ```
 
 Working in a clone? Use `.` in place of the flake URL, e.g. `nix run .#codebase-memory-mcp-ui -- --ui=true`, or drop into a shell that puts the binary on `PATH` with `nix shell .#codebase-memory-mcp-ui`.
@@ -398,7 +398,7 @@ Working in a clone? Use `.` in place of the flake URL, e.g. `nix run .#codebase-
 ### Install via Claude Code
 
 ```
-You: "Install this MCP server: https://github.com/DeusData/codebase-memory-mcp"
+You: "Install this MCP server: https://github.com/Be90nia/codebase-memory-mcp-pro"
 ```
 
 ### Build from Source
@@ -416,7 +416,7 @@ You: "Install this MCP server: https://github.com/DeusData/codebase-memory-mcp"
 </details>
 
 ```bash
-git clone https://github.com/DeusData/codebase-memory-mcp.git
+git clone https://github.com/Be90nia/codebase-memory-mcp-pro.git
 cd codebase-memory-mcp
 scripts/build.sh --with-ui          # the shipped composition (graph UI embedded)
 scripts/build.sh                    # without the UI (development only)
@@ -861,7 +861,7 @@ internal/cbm/         Vendored tree-sitter grammars (162 languages) + AST extrac
 Every release is verified through a multi-layer pipeline before publication:
 
 - **VirusTotal** — all 24 executable candidates (unstripped, debug-stripped and stripped) across the eight release products are scanned before smoke/soak (clean is preferred and only the single-Microsoft `!ml` tolerance documented in [SECURITY.md](SECURITY.md#our-release-policy) may pass; the number of engines that returned a decisive result is recorded as evidence but is VirusTotal fleet availability, not a pass condition). The selected executable is packaged without changing its SHA-256, release notes link the verdict for the exact bytes shipped, and the full per-candidate evidence is published alongside the release as TSVs for anyone auditing the selection. Every distinct object extracted from the shipped containers — `install.sh`, `install.ps1`, `LICENSE`, `THIRD_PARTY_NOTICES.md`, the MCPB `manifest.json` and the unpacked UI assets — is then scanned as well, so the full published surface is covered, not just the executables.
-- **SLSA Level 3** — cryptographic build provenance generated by the trusted GitHub Actions build workflow; verify with `gh attestation verify <file> --repo DeusData/codebase-memory-mcp --signer-workflow DeusData/codebase-memory-mcp/.github/workflows/_build.yml`
+- **SLSA Level 3** — cryptographic build provenance generated by the trusted GitHub Actions build workflow; verify with `gh attestation verify <file> --repo Be90nia/codebase-memory-mcp-pro --signer-workflow Be90nia/codebase-memory-mcp-pro/.github/workflows/_build.yml`
 - **Sigstore cosign** — keyless signatures on all artifacts; bundles included in every release
 - **SHA-256 checksums** — `checksums.txt` published with every release; verified by both install scripts before extraction
 - **CodeQL SAST** — blocks release pipeline if any open alerts remain

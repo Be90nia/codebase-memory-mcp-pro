@@ -19,7 +19,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-REPO = "DeusData/codebase-memory-mcp"
+REPO = "Be90nia/codebase-memory-mcp-pro"
 _WINDOWS_BINARY_NAME = "codebase-memory-mcp.exe"
 _UNIX_ARCHIVE_NAMES = (
     "codebase-memory-mcp",

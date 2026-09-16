@@ -20,7 +20,7 @@
 ## Links
 
 - Homepage: https://deusdata.github.io/codebase-memory-mcp/
-- Source code (GitHub): https://github.com/DeusData/codebase-memory-mcp
-- Latest release: https://github.com/DeusData/codebase-memory-mcp/releases/latest
-- Benchmark report: https://github.com/DeusData/codebase-memory-mcp/blob/main/docs/BENCHMARK.md
+- Source code (GitHub): https://github.com/Be90nia/codebase-memory-mcp-pro
+- Latest release: https://github.com/Be90nia/codebase-memory-mcp-pro/releases/latest
+- Benchmark report: https://github.com/Be90nia/codebase-memory-mcp-pro/blob/main/docs/BENCHMARK.md
 - Research paper: https://arxiv.org/abs/2603.27277

@@ -151,7 +151,7 @@ static void handle_ui_config(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     cbm_http_replyf(c, 200, g_cors_json,
                     "{\"lang\":\"%s\",\"version\":\"%s\",\"upstream_issues_url\":\"%s\"}",
                     lang_buf, CBM_VERSION,
-                    "https://github.com/DeusData/codebase-memory-mcp/issues/new");
+                    "https://github.com/Be90nia/codebase-memory-mcp-pro/issues/new");
 }
 
 /* ── Server state ─────────────────────────────────────────────── */

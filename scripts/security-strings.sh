@@ -80,8 +80,8 @@ echo "--- URL audit ---"
 
 # Allowed URL prefixes
 ALLOWED_URLS=(
-    "https://api.github.com/repos/DeusData/codebase-memory-mcp"
-    "https://github.com/DeusData/codebase-memory-mcp"
+    "https://api.github.com/repos/Be90nia/codebase-memory-mcp-pro"
+    "https://github.com/Be90nia/codebase-memory-mcp-pro"
     # Our own org root and documentation site: the .mcpb bundle manifest carries
     # them as homepage/documentation fields, and the graph UI links the docs.
     "https://github.com/DeusData"

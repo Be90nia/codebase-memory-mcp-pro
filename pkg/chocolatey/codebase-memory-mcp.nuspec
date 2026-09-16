@@ -4,12 +4,12 @@
     <id>codebase-memory-mcp</id>
     <version>0.11.1</version>
     <title>codebase-memory-mcp</title>
-    <authors>DeusData</authors>
-    <projectUrl>https://github.com/DeusData/codebase-memory-mcp</projectUrl>
-    <licenseUrl>https://github.com/DeusData/codebase-memory-mcp/blob/main/LICENSE</licenseUrl>
+    <authors>Be90nia</authors>
+    <projectUrl>https://github.com/Be90nia/codebase-memory-mcp-pro</projectUrl>
+    <licenseUrl>https://github.com/Be90nia/codebase-memory-mcp-pro/blob/main/LICENSE</licenseUrl>
     <requireLicenseAcceptance>false</requireLicenseAcceptance>
-    <projectSourceUrl>https://github.com/DeusData/codebase-memory-mcp</projectSourceUrl>
-    <bugTrackerUrl>https://github.com/DeusData/codebase-memory-mcp/issues</bugTrackerUrl>
+    <projectSourceUrl>https://github.com/Be90nia/codebase-memory-mcp-pro</projectSourceUrl>
+    <bugTrackerUrl>https://github.com/Be90nia/codebase-memory-mcp-pro/issues</bugTrackerUrl>
     <tags>mcp ai claude code-intelligence codebase developer-tools tree-sitter llm</tags>
     <summary>Fast code intelligence engine for AI coding agents</summary>
     <description>
@@ -28,7 +28,7 @@ After installation, run:
 
 to configure your coding agents automatically.
     </description>
-    <releaseNotes>https://github.com/DeusData/codebase-memory-mcp/releases/tag/v0.11.1</releaseNotes>
+    <releaseNotes>https://github.com/Be90nia/codebase-memory-mcp-pro/releases/tag/v0.11.1</releaseNotes>
   </metadata>
   <files>
     <file src="tools\**" target="tools" />

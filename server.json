@@ -1,10 +1,10 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.DeusData/codebase-memory-mcp",
+  "name": "io.github.Be90nia/codebase-memory-mcp-pro",
   "title": "Codebase Memory",
   "description": "Codebase knowledge graph for AI agents — 162 languages, sub-ms queries, 99% fewer tokens.",
   "repository": {
-    "url": "https://github.com/DeusData/codebase-memory-mcp",
+    "url": "https://github.com/Be90nia/codebase-memory-mcp-pro",
     "source": "github"
   },
   "websiteUrl": "https://deusdata.github.io/codebase-memory-mcp/",

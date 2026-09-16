@@ -14,7 +14,7 @@ FROM debian:bookworm-slim AS fetch
 ARG TARGETARCH
 RUN apt-get update \
  && apt-get install -y --no-install-recommends curl ca-certificates \
- && curl -fsSL "https://github.com/DeusData/codebase-memory-mcp/releases/latest/download/codebase-memory-mcp-linux-${TARGETARCH}-portable.tar.gz" \
+ && curl -fsSL "https://github.com/Be90nia/codebase-memory-mcp-pro/releases/latest/download/codebase-memory-mcp-linux-${TARGETARCH}-portable.tar.gz" \
       | tar -xz -C /tmp codebase-memory-mcp LICENSE THIRD_PARTY_NOTICES.md \
  && chmod +x /tmp/codebase-memory-mcp \
  && rm -rf /var/lib/apt/lists/*
