@@ -464,7 +464,7 @@ typedef struct {
 } tool_def_t;
 
 static const tool_def_t TOOLS[] = {
-    {"explore", "Explore",
+    {"explore",
      "PRIMARY exploration tool — call FIRST for 'how does X work', 'where is X', or surveying an "
      "area. In ONE call returns the blast-radius (callers), nearby NEIGHBORS (1-hop callees + "
      "same-file symbols), AND the verbatim line-numbered source of the matched symbols grouped by "
