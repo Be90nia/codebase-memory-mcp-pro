@@ -36,6 +36,7 @@ enum {
     /* Upper bound only for readiness polling loops; loops exit early once the awaited state
        is observed. Loaded CI runners (macos-15-intel) can outrun tighter windows. */
     LOCK_REGISTRY_OBSERVE_WINDOW_MS = 2000,
+    LOCK_REGISTRY_DEADLINE_WAIT_MS = 200,
 };
 
 typedef struct {
@@ -1024,7 +1025,8 @@ typedef struct {
     atomic_bool ready;
     atomic_bool go;
     atomic_bool finished;
-    uint64_t deadline_ms;
+    uint64_t wait_ms;
+    uint64_t started_ms;
     uint64_t returned_ms;
     cbm_private_file_lock_status_t status;
     cbm_lock_lease_t *lease;
@@ -1037,9 +1039,14 @@ static void *lock_registry_deadline_waiter_run(void *opaque) {
     while (!atomic_load_explicit(&waiter->go, memory_order_acquire)) {
         lock_registry_test_yield();
     }
-    waiter->status =
-        cbm_lock_registry_acquire(waiter->registry, "absolute-deadline", CBM_PRIVATE_FILE_LOCK_EX,
-                                  waiter->deadline_ms, &waiter->cancel_token, &waiter->lease);
+    /* The absolute deadline is anchored here, in the thread it bounds, right
+     * before the call it bounds. An anchor taken by the observer is already
+     * running while this thread is still waiting to be scheduled, so on a
+     * loaded host it can expire before the acquire even starts. */
+    waiter->started_ms = cbm_now_ms();
+    waiter->status = cbm_lock_registry_acquire(
+        waiter->registry, "absolute-deadline", CBM_PRIVATE_FILE_LOCK_EX,
+        waiter->started_ms + waiter->wait_ms, &waiter->cancel_token, &waiter->lease);
     waiter->returned_ms = cbm_now_ms();
     atomic_store_explicit(&waiter->finished, true, memory_order_release);
     return NULL;
@@ -1081,6 +1088,7 @@ TEST(lock_registry_absolute_deadline_survives_repeated_wakes) {
     }
 
     lock_registry_deadline_waiter_t tail = {.registry = fixture.registry,
+                                            .wait_ms = LOCK_REGISTRY_DEADLINE_WAIT_MS,
                                             .status = CBM_PRIVATE_FILE_LOCK_IO};
     atomic_init(&tail.cancel_token, false);
     atomic_init(&tail.ready, false);
@@ -1126,7 +1134,13 @@ TEST(lock_registry_absolute_deadline_survives_repeated_wakes) {
     }
     bool returned_at_deadline =
         tail_ready && atomic_load_explicit(&tail.finished, memory_order_acquire);
-    uint64_t elapsed_ms = returned_at_deadline ? tail.returned_ms - deadline_start : UINT64_MAX;
+    /* The enqueue count only ever grows, so this stays true once the tail has
+     * joined the queue behind the attempting head. Reading it after the tail
+     * has returned removes the window the observer used to have to catch. */
+    uint64_t enqueues_after_tail =
+        cbm_lock_registry_waiter_enqueue_count_for_test(fixture.registry);
+    bool tail_queued = returned_at_deadline && enqueues_after_tail > enqueues_before_tail;
+    uint64_t elapsed_ms = returned_at_deadline ? tail.returned_ms - tail.started_ms : UINT64_MAX;
 
     if (!returned_at_deadline && tail_started) {
         (void)cbm_lock_registry_request_cancel(fixture.registry, &tail.cancel_token);
