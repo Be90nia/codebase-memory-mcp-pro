@@ -52,8 +52,8 @@ src/git/git_context.c	18
 src/main.c	32
 src/mcp/compact_out.c	39
 src/mcp/index_supervisor.c	8
-src/mcp/mcp.c	814
-src/pipeline/artifact.c	38
+src/mcp/mcp.c	844
+src/pipeline/artifact.c	40
 src/pipeline/fqn.c	23
 src/pipeline/lsp_resolve.h	4
 src/pipeline/lsp_surface.c	5
@@ -66,7 +66,7 @@ src/pipeline/pass_definitions.c	14
 src/pipeline/pass_enrichment.c	15
 src/pipeline/pass_ensemble_routing.c	10
 src/pipeline/pass_envscan.c	2
-src/pipeline/pass_githistory.c	27
+src/pipeline/pass_githistory.c	29
 src/pipeline/pass_importance.c	4
 src/pipeline/pass_infrascan.c	2
 src/pipeline/pass_k8s.c	13
@@ -84,7 +84,7 @@ src/pipeline/registry.c	19
 src/pipeline/worker_pool.c	2
 src/store/store.c	358
 src/ui/config.c	12
-src/ui/http_server.c	31
+src/ui/http_server.c	32
 src/ui/httpd.c	21
 src/ui/layout3d.c	66
 src/watcher/watcher.c	33
