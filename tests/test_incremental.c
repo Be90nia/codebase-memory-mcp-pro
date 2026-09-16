@@ -3086,16 +3086,24 @@ TEST(tool_delete_and_verify) {
  * as a JSON field (the tree encoder omits it). */
 TEST(tool_detect_changes_impacted_depth) {
     double ms;
+    /* max_output_tokens raised so the response does not hit the budget floor —
+     * the floor replaces the full payload with truncation_reason/truncated/hint
+     * only, and the M2-b2 depth/impacted_total fields never reach the wire.
+     * max_output_tokens=1_000_000 is the documented ceiling (see
+     * mcp_add_tool_def for detect_changes). */
+    const char *tok = ",\"max_output_tokens\":1000000";
 
     /* Default depth: new keys present. */
-    char *r = call_tool_timed("detect_changes", &ms, "{\"project\":\"%s\",\"format\":\"json\"}", g_project);
+    char *r = call_tool_timed("detect_changes", &ms,
+                              "{\"project\":\"%s\",\"format\":\"json\"%s}", g_project, tok);
     TOOL_OK(r, ms);
     ASSERT(resp_has_key(r, "impacted_total"));
     ASSERT(resp_has_key(r, "depth"));
     free(r);
 
     /* Explicit depth=0 → echoed verbatim (direct symbols only). */
-    r = call_tool_timed("detect_changes", &ms, "{\"project\":\"%s\",\"depth\":0,\"format\":\"json\"}", g_project);
+    r = call_tool_timed("detect_changes", &ms,
+                        "{\"project\":\"%s\",\"depth\":0,\"format\":\"json\"%s}", g_project, tok);
     TOOL_OK(r, ms);
     ASSERT_EQ(count_in_response(r, "depth"), 0);
     int impacted_0 = count_in_response(r, "impacted_total");
@@ -3103,14 +3111,16 @@ TEST(tool_detect_changes_impacted_depth) {
     free(r);
 
     /* depth=1 → echoed; impact set is a superset of depth=0 (transitive callers add). */
-    r = call_tool_timed("detect_changes", &ms, "{\"project\":\"%s\",\"depth\":1,\"format\":\"json\"}", g_project);
+    r = call_tool_timed("detect_changes", &ms,
+                        "{\"project\":\"%s\",\"depth\":1,\"format\":\"json\"%s}", g_project, tok);
     TOOL_OK(r, ms);
     ASSERT_EQ(count_in_response(r, "depth"), 1);
     ASSERT_GTE(count_in_response(r, "impacted_total"), impacted_0);
     free(r);
 
     /* Extreme depth=999 → clamped to MCP_MAX_DEPTH (15). */
-    r = call_tool_timed("detect_changes", &ms, "{\"project\":\"%s\",\"depth\":999,\"format\":\"json\"}", g_project);
+    r = call_tool_timed("detect_changes", &ms,
+                        "{\"project\":\"%s\",\"depth\":999,\"format\":\"json\"%s}", g_project, tok);
     TOOL_OK(r, ms);
     ASSERT_LTE(count_in_response(r, "depth"), 15);
     ASSERT_GTE(count_in_response(r, "depth"), 0);
