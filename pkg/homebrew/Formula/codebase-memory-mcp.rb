@@ -1,28 +1,28 @@
 class CodebaseMemoryMcp < Formula
   desc "Fast code intelligence engine for AI coding agents"
   homepage "https://github.com/Be90nia/codebase-memory-mcp-pro"
-  version "0.10.3"
+  version "0.10.9"
   license "MIT"
 
   on_macos do
     on_arm do
       url "https://github.com/Be90nia/codebase-memory-mcp-pro/releases/download/v#{version}/codebase-memory-mcp-darwin-arm64.tar.gz"
-      sha256 "0ebf02328207d4c3d862c837b5e973de5bac808df92b0941737721d467287f7f"
+      sha256 "9bedd7c772b4f505437e84605261fdf57a0ef89814fb7acf32c6e77798b1b1db"
     end
     on_intel do
       url "https://github.com/Be90nia/codebase-memory-mcp-pro/releases/download/v#{version}/codebase-memory-mcp-darwin-amd64.tar.gz"
-      sha256 "1107fea28285823e1436e4f38a4e00a0b472d8a43c379da7dfd200c914a4b9dd"
+      sha256 "f6e0c230001d38db553cf5f19e1ba1e7feb7af2ba4f23d039bd3f30bee27e136"
     end
   end
 
   on_linux do
     on_arm do
       url "https://github.com/Be90nia/codebase-memory-mcp-pro/releases/download/v#{version}/codebase-memory-mcp-linux-arm64.tar.gz"
-      sha256 "967b9eababfdbd2ef1987c571d55bc7c028cd1db7f99279830634c58db311e32"
+      sha256 "737c2a74c0721cd9458d01f8c66f343ccdc1510915d805f582b0f0d344ea78c2"
     end
     on_intel do
       url "https://github.com/Be90nia/codebase-memory-mcp-pro/releases/download/v#{version}/codebase-memory-mcp-linux-amd64.tar.gz"
-      sha256 "74997fb0934e70a22f20c2e112fb4d883867dc1f01a7bcdc94cf86d13b5cbd31"
+      sha256 "55e7c5f3b699bf04a87f311a243c148f41ce8e0860eae16b81473f82eac379f0"
     end
   end
 
