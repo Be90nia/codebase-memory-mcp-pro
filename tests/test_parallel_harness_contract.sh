@@ -157,6 +157,13 @@ if suite == "hang_after_summary":
     print("  1 passed", flush=True)
     time.sleep(30)
 elif suite in ("stubborn_tree", "timeout_exit_race"):
+    # The child must hold past the scheduler's refusal window, otherwise the
+    # Windows harness contract sees "no surviving descendant" and reports the
+    # race fixture as no longer exercising the race. v0.10.8's refusal landed
+    # inside the 30s sleep; v0.11.0's Windows descendant probe (15s + retry)
+    # pushes the refusal past 30s, so the child now needs to wait until
+    # force_cleanup terminates it. POSIX still ignores SIGTERM so a parent
+    # kill is the only way out.
     child = subprocess.Popen(
         [
             sys.executable,
@@ -165,7 +172,7 @@ elif suite in ("stubborn_tree", "timeout_exit_race"):
                 "import os,signal,time;"
                 "signal.signal(signal.SIGTERM,signal.SIG_IGN) "
                 "if os.name != 'nt' else None;"
-                "time.sleep(30)"
+                "while True: time.sleep(1)"
             ),
         ]
     )
