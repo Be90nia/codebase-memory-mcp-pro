@@ -59,6 +59,7 @@ jobs:
       actions: read
     steps:
       - name: Wait for CodeQL on current commit (max 150 min)
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
