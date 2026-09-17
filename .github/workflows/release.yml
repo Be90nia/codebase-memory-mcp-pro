@@ -36,6 +36,11 @@ on:
         required: false
         type: boolean
         default: false
+      skip_virustotal:
+        description: "Skip VirusTotal scan in verify (fork with no VIRUS_TOTAL_SCANNER_API_KEY); release notes mark unscanned-release"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -116,7 +121,7 @@ jobs:
       attest: true
       # Release builds have no scan bypass: both candidates in all eight
       # immutable target tuples must complete before smoke or soak starts.
-      scan_candidates: true
+      scan_candidates: ${{ !inputs.skip_virustotal }}
     secrets: inherit
 
   # ── 4. Smoke test every binary ──────────────────────────────────
@@ -364,12 +369,14 @@ jobs:
       # directions. The release notes then cited one scan while the links showed
       # the other. See scripts/ci/exclude-rescanned-selected-objects.sh.
       - name: Withhold already-scanned selected executables
+        if: ${{ inputs.skip_virustotal != true }}
         run: |
           bash scripts/ci/exclude-rescanned-selected-objects.sh \
             binaries/objects "$RUNNER_TEMP/release-selection.tsv" \
             binaries/virustotal-withheld.tsv
 
       - name: VirusTotal scan of every extracted release object
+        if: ${{ inputs.skip_virustotal != true }}
         uses: crazy-max/ghaction-virustotal@936d8c5c00afe97d3d9a1af26d017cfdf26800a2 # v5.0.0
         id: virustotal
         with:
@@ -380,6 +387,7 @@ jobs:
       # Same policy as the candidate gate: a single Microsoft `!ml` is tolerated
       # and disclosed, anything else blocks. Engine count is evidence, not a gate.
       - name: Wait for VirusTotal results
+        if: ${{ inputs.skip_virustotal != true }}
         env:
           VT_API_KEY: ${{ secrets.VIRUS_TOTAL_SCANNER_API_KEY }}
           VT_ANALYSIS: ${{ steps.virustotal.outputs.analysis }}
@@ -391,7 +399,7 @@ jobs:
         run: scripts/ci/check-virustotal.sh
 
       - name: Preserve extracted-object VirusTotal evidence
-        if: ${{ always() }}
+        if: ${{ inputs.skip_virustotal != true && always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: virustotal-evidence-release-${{ github.run_id }}
@@ -403,6 +411,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Publish durable public VirusTotal evidence
+        if: ${{ inputs.skip_virustotal != true }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ inputs.version }}
@@ -416,6 +425,7 @@ jobs:
       # Re-submitting the same executable bytes here would add wait time but no
       # new coverage, so publish the existing per-candidate verdicts instead.
       - name: Append candidate VirusTotal results to release notes
+        if: ${{ inputs.skip_virustotal != true }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ inputs.version }}
