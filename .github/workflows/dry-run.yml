@@ -78,6 +78,7 @@ jobs:
 
   # ── Tests (all platforms, perf tests skipped on CI) ────────────
   test:
+    if: ${{ inputs.skip_tests != true }}
     uses: ./.github/workflows/_test.yml
     with:
       skip_perf: true
