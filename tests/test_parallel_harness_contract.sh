@@ -169,10 +169,11 @@ elif suite in ("stubborn_tree", "timeout_exit_race"):
             sys.executable,
             "-c",
             (
-                "import os,signal,time;"
-                "signal.signal(signal.SIGTERM,signal.SIG_IGN) "
-                "if os.name != 'nt' else None;"
-                "while True: time.sleep(1)"
+                "import os, signal, time\n"
+                "if os.name != 'nt':\n"
+                "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "while True:\n"
+                "    time.sleep(1)\n"
             ),
         ]
     )
