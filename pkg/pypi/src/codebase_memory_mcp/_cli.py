@@ -19,7 +19,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-REPO = "DeusData/codebase-memory-mcp"
+REPO = "Be90nia/codebase-memory-mcp-pro"
 _WINDOWS_BINARY_NAME = "codebase-memory-mcp.exe"
 _UNIX_ARCHIVE_NAMES = (
     "codebase-memory-mcp",
@@ -338,7 +338,7 @@ def _version() -> str:
         from importlib.metadata import version
         return version("codebase-memory-mcp")
     except Exception:
-        return "0.8.1"
+        return "0.11.1"
 
 
 def _os_name() -> str:

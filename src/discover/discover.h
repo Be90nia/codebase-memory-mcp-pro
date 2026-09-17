@@ -41,8 +41,14 @@ CBMLanguage cbm_disambiguate_m(const char *path);
 
 /* Disambiguate .cls files by reading first 4KB of content.
  * Returns CBM_LANG_OBJECTSCRIPT_UDL if a line starts with "Class <Uppercase>",
+ * CBM_LANG_COUNT (unsupported) for a Visual Basic 6 class module (#721),
  * otherwise CBM_LANG_APEX. On read failure, defaults to CBM_LANG_APEX. */
 CBMLanguage cbm_disambiguate_cls(const char *path);
+
+/* Disambiguate .frm files by reading first 4KB of content (#721).
+ * Returns CBM_LANG_COUNT (unsupported) for a Visual Basic 6 form, otherwise
+ * CBM_LANG_FORM. On read failure, defaults to CBM_LANG_FORM. */
+CBMLanguage cbm_disambiguate_frm(const char *path);
 
 /* Disambiguate .inc files by reading first 4KB of content.
  * Returns CBM_LANG_OBJECTSCRIPT_ROUTINE if it looks like an ObjectScript
@@ -63,6 +69,12 @@ CBMLanguage cbm_disambiguate_inc(const char *path);
  * Fails closed (returns CBM_LANG_COUNT) on read error, missing/malformed
  * shebang, an embedded NUL in the first line, or an unknown interpreter. */
 CBMLanguage cbm_language_from_shebang(const char *path);
+
+/* Disambiguate .cfc files by reading the head of the content.
+ * Returns CBM_LANG_CFML if the component is tag-based (a "<cfcomponent" tag, or a
+ * leading '<'), otherwise CBM_LANG_CFSCRIPT for script-dialect components.
+ * On read failure, defaults to CBM_LANG_CFSCRIPT. */
+CBMLanguage cbm_disambiguate_cfc(const char *path);
 
 /* ── Gitignore pattern matching ──────────────────────────────────── */
 

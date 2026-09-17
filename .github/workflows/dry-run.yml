@@ -51,7 +51,7 @@ on:
         options: ['full', 'quick', 'none']
         default: 'quick'
       version:
-        description: 'Version string passed to the build (e.g. v0.10.9); empty = dev'
+        description: 'Version string passed to the build (e.g. v0.11.1); empty = dev'
         type: string
         default: ''
 
@@ -62,6 +62,13 @@ jobs:
   # ── Security (independent island — does not block main pipeline) ──
   security:
     uses: ./.github/workflows/_security.yml
+    # The called job requests security-events:read to count code-scanning
+    # alerts; a reusable workflow cannot request more than its caller grants,
+    # so withholding this here fails the whole run at startup.
+    permissions:
+      contents: read
+      security-events: read
+      actions: read
     secrets: inherit
 
   # ── Lint (cppcheck + clang-format) ────────────────────────────

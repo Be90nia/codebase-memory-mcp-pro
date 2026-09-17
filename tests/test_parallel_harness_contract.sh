@@ -30,6 +30,116 @@ if ! grep -Fq 'run-test-wave.py' "$driver"; then
     exit 1
 fi
 
+# The Windows descendant proof must not be timed by --kill-grace. That argument
+# bounds how long a *process* may resist termination (this file runs the
+# scheduler with 1s); the probe is a cold PowerShell + CIM start that routinely
+# costs seconds on a runner. Binding one to the other made the verdict a
+# function of interpreter latency: a slow start became "assume the worst" and
+# reddened an already-clean shard. Asserted structurally -- no sleeps, no timing
+# thresholds -- so the contract stays deterministic on every platform.
+# (Command substitution, not `| grep -q`: under pipefail an early-exiting
+# reader can hand the writer EPIPE and turn a satisfied match into status 141.)
+probe_sites=$(grep -n 'windows_tree_cleanup_blocker(' "$scheduler" || true)
+if [[ "$probe_sites" == *kill_grace* ]]; then
+    echo "FAIL: the Windows descendant probe is still timed by --kill-grace" >&2
+    exit 1
+fi
+
+# Barrier files must be published atomically. Path.write_text creates and
+# truncates before it writes, so a poller that saw `<suite>.ready` appear and
+# then parsed the leader pid could read the zero-byte window and fail on
+# int("") -- a scheduler-side race surfacing as a harness flake. Asserted
+# structurally: no barrier file is written in place, and the scheduler renames
+# a same-directory temp file onto the destination instead.
+barrier_writes=$(grep -nE '^[[:space:]]*(ready|leader_exited)\.write_text\(' "$scheduler" || true)
+if [ -n "$barrier_writes" ]; then
+    echo "FAIL: scheduler barrier files are written in place (non-atomic):" >&2
+    echo "$barrier_writes" >&2
+    exit 1
+fi
+if ! grep -Fq 'os.replace(' "$scheduler"; then
+    echo "FAIL: scheduler does not rename barrier files into place" >&2
+    exit 1
+fi
+
+python3 - "$scheduler" <<'PROBE'
+from __future__ import annotations
+
+import importlib.util
+import subprocess
+import sys
+
+
+spec = importlib.util.spec_from_file_location("cbm_run_test_wave", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+# @dataclass resolves its own module out of sys.modules; register before exec.
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+budget = getattr(module, "WINDOWS_DESCENDANT_PROBE_SECONDS", None)
+if not isinstance(budget, int) or budget < 15:
+    raise SystemExit(
+        "FAIL: the descendant probe has no independent budget "
+        f"(WINDOWS_DESCENDANT_PROBE_SECONDS={budget!r})"
+    )
+
+probe = module.windows_tree_cleanup_blocker
+original_run = subprocess.run
+observed: list[object] = []
+
+
+def timing_out(*args: object, **kwargs: object) -> object:
+    observed.append(kwargs.get("timeout"))
+    raise subprocess.TimeoutExpired(cmd="probe", timeout=kwargs.get("timeout"))
+
+
+class _Completed:
+    def __init__(self, stdout: str) -> None:
+        self.returncode = 0
+        self.stdout = stdout
+
+
+try:
+    subprocess.run = timing_out
+    timed_out_reason = probe(4321)
+    subprocess.run = lambda *a, **k: _Completed("3\n")
+    live_reason = probe(4321)
+    subprocess.run = lambda *a, **k: _Completed("0\n")
+    clean_reason = probe(4321)
+finally:
+    subprocess.run = original_run
+
+if observed != [budget] * len(observed):
+    raise SystemExit(
+        "FAIL: the descendant probe is not bounded by its own budget "
+        f"(timeouts={observed})"
+    )
+if len(observed) < 2:
+    raise SystemExit(
+        "FAIL: the descendant probe does not retry a timed-out probe "
+        f"(attempts={len(observed)})"
+    )
+if timed_out_reason is None or live_reason is None:
+    raise SystemExit(
+        "FAIL: the descendant probe stopped failing closed "
+        f"(timed_out={timed_out_reason!r}, live={live_reason!r})"
+    )
+if clean_reason is not None:
+    raise SystemExit(f"FAIL: a clean tree was not proven clean ({clean_reason!r})")
+if "could not complete" not in timed_out_reason:
+    raise SystemExit(
+        f"FAIL: an unfinished probe is not named as one ({timed_out_reason!r})"
+    )
+if "3 live descendant" not in live_reason:
+    raise SystemExit(
+        f"FAIL: proven descendants are not reported with their count ({live_reason!r})"
+    )
+if timed_out_reason == live_reason:
+    raise SystemExit(
+        "FAIL: an unfinished probe and a leaked tree are reported identically"
+    )
+PROBE
+
 cat >"$fixture/fake_runner.py" <<'PY'
 from __future__ import annotations
 
@@ -47,6 +157,13 @@ if suite == "hang_after_summary":
     print("  1 passed", flush=True)
     time.sleep(30)
 elif suite in ("stubborn_tree", "timeout_exit_race"):
+    # The child must hold past the scheduler's refusal window, otherwise the
+    # Windows harness contract sees "no surviving descendant" and reports the
+    # race fixture as no longer exercising the race. v0.10.8's refusal landed
+    # inside the 30s sleep; v0.11.0's Windows descendant probe (15s + retry)
+    # pushes the refusal past 30s, so the child now needs to wait until
+    # force_cleanup terminates it. POSIX still ignores SIGTERM so a parent
+    # kill is the only way out.
     child = subprocess.Popen(
         [
             sys.executable,
@@ -55,7 +172,7 @@ elif suite in ("stubborn_tree", "timeout_exit_race"):
                 "import os,signal,time;"
                 "signal.signal(signal.SIGTERM,signal.SIG_IGN) "
                 "if os.name != 'nt' else None;"
-                "time.sleep(30)"
+                "while True: time.sleep(1)"
             ),
         ]
     )
@@ -251,7 +368,12 @@ PY
 printf '%s\n' timeout_exit_race >"$fixture/suites.txt"
 : >"$fixture/results.txt"
 rm -f "$fixture/descendant.pid"
-: >"$fixture/barrier/timeout_exit_race.hold"
+# Write the barrier hold from Python: bash's mktemp -d path (e.g.
+# /tmp/cbm-parallel-harness.XXXXXX) and Python's pathlib.Path on Windows
+# resolve that prefix to different locations, so the scheduler's
+# `wait_for_test_pre_terminate_barrier` (which only ever sees the Python
+# view) cannot see a hold file bash wrote. Move the write inside the same
+# interpreter that owns the scheduler invocation.
 python3 - "$scheduler" "$fixture" "$(command -v python3)" <<'PY'
 from __future__ import annotations
 
@@ -273,6 +395,15 @@ ready = barrier / "timeout_exit_race.ready"
 leader_exited = barrier / "timeout_exit_race.leader-exited"
 release = barrier / "timeout_exit_race.release"
 descendant_path = fixture / "descendant.pid"
+
+# Write the barrier hold from this interpreter: bash mktemp -d resolves the
+# /tmp prefix via the MSYS mount table, while pathlib.Path on Windows treats
+# /tmp as a drive-relative path. A hold file bash writes and a barrier
+# scheduler reads therefore land in different directories. Writing the
+# hold here, with the same pathlib view the scheduler will use, makes
+# them land in the same directory.
+barrier.mkdir(parents=True, exist_ok=True)
+(barrier / "timeout_exit_race.hold").touch()
 
 
 def process_state(pid: int) -> str:
@@ -357,7 +488,37 @@ try:
         time.sleep(0.02)
 
     leader_pid = int(ready.read_text(encoding="utf-8"))
-    os.kill(leader_pid, signal.SIGTERM)
+    # On Windows, os.kill(pid, SIGTERM) translates to CTRL_BREAK_EVENT for
+    # processes started with CREATE_NEW_PROCESS_GROUP (as the scheduler does
+    # in run-test-wave.py). Python ignores that signal, so the leader never
+    # actually exits and the scheduler falls through to its taskkill /T path
+    # -- which kills the descendant along with the leader and the contract
+    # sees a "no surviving descendant" race.
+    #
+    # taskkill.exe in PATH is ambiguous on MSYS runners (msys-core ships its
+    # own taskkill, which only sees the MSYS process table), so call
+    # TerminateProcess directly via the Win32 API. That kills the Windows
+    # process by handle regardless of which "taskkill" the shell would have
+    # found, and without /T so the descendant is left for the refusal probe.
+    if os.name == "nt":
+        handle = ctypes.windll.kernel32.OpenProcess(0x0001, False, leader_pid)
+        if not handle:
+            raise SystemExit(
+                f"FAIL: could not open the race leader handle "
+                f"(leader_pid={leader_pid}, last_error="
+                f"{ctypes.GetLastError()})"
+            )
+        try:
+            if not ctypes.windll.kernel32.TerminateProcess(handle, 0):
+                raise SystemExit(
+                    f"FAIL: TerminateProcess refused the race leader "
+                    f"(leader_pid={leader_pid}, last_error="
+                    f"{ctypes.GetLastError()})"
+                )
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    else:
+        os.kill(leader_pid, signal.SIGTERM)
     deadline = time.monotonic() + 3
     while not leader_exited.exists():
         if process.poll() is not None:
@@ -370,7 +531,11 @@ try:
             raise SystemExit("FAIL: scheduler did not observe the forced leader exit")
         time.sleep(0.02)
     release.write_text("release\n", encoding="utf-8")
-    stdout, stderr = process.communicate(timeout=8)
+    # Generous on purpose: the scheduler's refusal is the asserted state, and
+    # on Windows it now spends up to the descendant-probe budget (twice --
+    # once in the wave loop, once in the cleanup pass) before refusing. This
+    # bound only has to exceed that worst case; it never decides the verdict.
+    stdout, stderr = process.communicate(timeout=120)
 
     if os.name == "nt":
         # Assert the PROPERTY, not the wording. This used to require the phrase

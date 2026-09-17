@@ -76,7 +76,7 @@ if len(mcpb) != 2:
     fail(f"expected 2 mcpb entries (only .mcpb lines count), got {len(mcpb)}")
 else:
     first = mcpb[0]
-    wanted_url = ("https://github.com/DeusData/codebase-memory-mcp/releases/"
+    wanted_url = ("https://github.com/Be90nia/codebase-memory-mcp-pro/releases/"
                   "download/v9.9.9/codebase-memory-mcp-darwin-arm64.mcpb")
     if first.get("identifier") != wanted_url:
         fail(f"darwin identifier wrong: {first.get('identifier')}")

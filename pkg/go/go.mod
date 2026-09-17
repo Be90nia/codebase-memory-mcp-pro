@@ -1,3 +1,3 @@
-module github.com/DeusData/codebase-memory-mcp/pkg/go
+module github.com/Be90nia/codebase-memory-mcp-pro/pkg/go
 
 go 1.26.1

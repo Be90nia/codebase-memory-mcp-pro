@@ -6,7 +6,7 @@
 //
 // Install:
 //
-//	go install github.com/DeusData/codebase-memory-mcp/pkg/go/cmd/codebase-memory-mcp@latest
+//	go install github.com/Be90nia/codebase-memory-mcp-pro/pkg/go/cmd/codebase-memory-mcp@latest
 package main
 
 import (
@@ -35,8 +35,8 @@ import (
 )
 
 const (
-	repo              = "DeusData/codebase-memory-mcp"
-	version           = "0.8.1"
+	repo              = "Be90nia/codebase-memory-mcp-pro"
+	version           = "0.11.1"
 	windowsBinaryName = "codebase-memory-mcp.exe"
 
 	maxRedirects            = 5
@@ -122,7 +122,7 @@ func main() {
 	if mutation == "update" {
 		fmt.Fprintln(
 			os.Stderr,
-			"This Go wrapper is maintained by Go. Update it with \"go install github.com/DeusData/codebase-memory-mcp/pkg/go/cmd/codebase-memory-mcp@latest\".",
+			"This Go wrapper is maintained by Go. Update it with \"go install github.com/Be90nia/codebase-memory-mcp-pro/pkg/go/cmd/codebase-memory-mcp@latest\".",
 		)
 		os.Exit(2)
 	}

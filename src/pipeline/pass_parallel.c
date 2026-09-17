@@ -30,7 +30,9 @@ enum {
     /* Extraction memory back-pressure: when the process is over its RSS budget,
      * a worker reclaims + naps before pulling another file so peers can finish
      * and return pages. Bounded spins avoid deadlock when the resident graph
-     * itself is near budget (then proceed with a soft overshoot). */
+     * itself is near budget: then ONE confirmation cycle decides — drained
+     * means continue, still over means the attempt fails whole (decision A,
+     * #1997 #832) instead of the former open-ended soft overshoot. */
     PP_BACKPRESSURE_MAX_SPINS = 40,
     PP_BACKPRESSURE_NAP_NS = 3000000, /* 3 ms */
 };
@@ -68,13 +70,17 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 #define PP_RETAIN_PER_FILE_HARD_MAX_BYTES (32ULL * 1024 * 1024) /* 32 MiB per file */
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
+#include "result_spill.h"
+#include "foundation/platform.h"     /* cbm_resolve_cache_dir */
 #include "pipeline/pass_lsp_cross.h" /* cbm_pxc_* helpers for fused cross-file LSP */
 #include "pipeline/lsp_resolve.h"
+#include "lsp/rust_cargo.h"
 #include "helpers.h" /* cbm_kind_in_set_free_cache — per-worker-thread cache teardown */
 #include "pipeline/worker_pool.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
+#include "foundation/mem_core.h"
 #include "graph_buffer/graph_buffer.h"
 #include "service_patterns.h"
 #include "foundation/platform.h"
@@ -646,6 +652,12 @@ typedef struct {
     _Atomic int64_t *shared_ids;
     _Atomic int *cancelled;
     _Atomic int next_file_idx;
+    cbm_pipeline_ctx_t *pctx;         /* spill store + mode latch live here */
+    _Atomic uint8_t *slot_state;      /* per file: 0 in progress, 1 cached, 2 parked */
+    _Atomic int spill_sweeps_running; /* workers inside pp_spill_sweep right now */
+    int spill_env;        /* CBM_MEM_SPILL for this run: 1 force, 0 off, 2 budget decides */
+    cbm_mutex_t spill_mu; /* serializes the one store open */
+    _Atomic int spill_unavailable; /* store could not open: never retry */
 
     cbm_pkg_entries_t *pkg_entries; /* per-worker manifest arrays (separate allocation) */
 
@@ -666,6 +678,11 @@ typedef struct {
      * While set, pulls skip the nap (the designed soft overshoot); the cheap
      * over-budget probe re-arms the gate once RSS drains under budget. */
     _Atomic int bp_futile;
+    /* Decision A (#1997 #832): set once futility was CONFIRMED by a second
+     * full cycle that still ended over budget. Every pull loop breaks on it
+     * and extract returns CBM_PIPELINE_ABORT_OVER_BUDGET. Deliberately not
+     * the shared cancel token — that one belongs to client cancellation. */
+    _Atomic int over_budget_abort;
 
     const CBMMacroTable *macro_table;            /* ObjectScript $$$macros (NULL if none) */
     const CBMReturnTypeTable *return_type_table; /* ObjectScript return types (NULL if none) */
@@ -721,13 +738,237 @@ static void log_extract_done(int pos, uint64_t ms, int defs, const char *path) {
     }
 }
 
+/* One back-pressure cycle: reclaim this thread's freed pages, then nap in
+ * bounded 3 ms steps while the process stays over budget. Counted for test
+ * observability. Returns true when the FULL cycle elapsed still over budget —
+ * the resident floor, not in-flight transients, holds the memory. */
+static bool pp_backpressure_cycle_still_over(extract_ctx_t *ec) {
+    cbm_mem_collect();
+    atomic_fetch_add_explicit(&g_bp_nap_cycles, SKIP_ONE, memory_order_relaxed);
+    int bp = 0;
+    for (; bp < PP_BACKPRESSURE_MAX_SPINS && cbm_mem_over_budget() &&
+           !atomic_load_explicit(ec->cancelled, memory_order_relaxed) &&
+           !atomic_load_explicit(&ec->over_budget_abort, memory_order_relaxed);
+         bp++) {
+        struct timespec nap = {0, PP_BACKPRESSURE_NAP_NS};
+        cbm_nanosleep(&nap, NULL);
+    }
+    return bp == PP_BACKPRESSURE_MAX_SPINS && cbm_mem_over_budget();
+}
+
+/* Decision A (#1997 #832): back-pressure was futile and the confirmation
+ * cycle still ended over budget. The budget stops being advisory here: flag
+ * the attempt so every worker stops pulling and extract returns
+ * CBM_PIPELINE_ABORT_OVER_BUDGET. Cooperative on purpose — the failure must
+ * travel as a clean-exit worker response, never a kill, or the supervisor
+ * would quarantine innocent files. */
+static void pp_fail_whole_over_budget(extract_ctx_t *ec) {
+    if (atomic_exchange_explicit(&ec->over_budget_abort, 1, memory_order_relaxed) == 0) {
+        cbm_log_error("mem.budget.exceeded", "rss_mb",
+                      itoa_log((int)(cbm_mem_rss() / (1024 * 1024))), "budget_mb",
+                      itoa_log((int)(cbm_mem_budget() / (1024 * 1024))), "phase",
+                      "parallel_extract", "action", "fail_whole");
+    }
+}
+
+/* ── Spill / admission control ──────────────────────────────────────── */
+
+/* Spill mode is entered this fraction short of the budget: 1/16 = 6.25%,
+ * ~940 MB at 15 GB, above the 4% the kernel's in-flight files were measured
+ * to carry past the line. */
+enum { PP_SPILL_EARLY_DIV = 16 };
+
+/* CBM_MEM_SPILL=1 forces spill mode from the first file (tests, small
+ * machines); CBM_MEM_SPILL=0 keeps results in memory even over budget. Read
+ * once per extraction run, never cached per process: a test toggles it. */
+static int pp_spill_env_read(void) {
+    char buf[CBM_SZ_16];
+    if (cbm_safe_getenv("CBM_MEM_SPILL", buf, sizeof(buf), NULL)) {
+        return buf[0] == '1' ? 1 : 0;
+    }
+    return 2; /* unset: the budget decides */
+}
+static bool pp_spill_forced_by_env(const extract_ctx_t *ec) {
+    return ec->spill_env == 1;
+}
+static bool pp_spill_allowed(const extract_ctx_t *ec) {
+    return ec->spill_env != 0;
+}
+
+/* Latch spill mode (once) and open the store. The store is open BEFORE the
+ * latch is visible: a peer that reads the latch must also find the store, or
+ * it sees "nothing to park" while this worker is still opening files and runs
+ * the futility cycle instead of joining the sweep (kernel, 16 GB budget,
+ * 2026-09-13: the abort fired before the first sweep had logged). Never fails
+ * the run: without a store the results simply stay in memory and the nap /
+ * futility path applies as before. */
+static void pp_spill_enter(extract_ctx_t *ec, const char *reason) {
+    if (!ec->pctx || !ec->pctx->spill_allowed || !pp_spill_allowed(ec)) {
+        return;
+    }
+    if (atomic_load_explicit(&ec->pctx->spill_mode, memory_order_acquire) != 0 ||
+        atomic_load_explicit(&ec->spill_unavailable, memory_order_relaxed) != 0) {
+        return;
+    }
+    cbm_mutex_lock(&ec->spill_mu);
+    if (atomic_load_explicit(&ec->pctx->spill_mode, memory_order_acquire) == 0 &&
+        atomic_load_explicit(&ec->spill_unavailable, memory_order_relaxed) == 0) {
+        if (!ec->pctx->spill) {
+            ec->pctx->spill =
+                cbm_result_spill_open(cbm_resolve_cache_dir(), ec->max_workers, ec->file_count);
+        }
+        size_t mb = (size_t)1024 * 1024;
+        cbm_log_warn("mem.spill.on", "reason", reason, "charged_mb",
+                     itoa_log((int)(cbm_mem_charged() / mb)), "budget_mb",
+                     itoa_log((int)(cbm_mem_budget() / mb)), "store",
+                     ec->pctx->spill ? "open" : "unavailable");
+        if (ec->pctx->spill) {
+            atomic_store_explicit(&ec->pctx->spill_mode, 1, memory_order_release);
+        } else {
+            atomic_store_explicit(&ec->spill_unavailable, 1, memory_order_relaxed);
+        }
+    }
+    cbm_mutex_unlock(&ec->spill_mu);
+}
+
+static bool pp_spill_active(const extract_ctx_t *ec) {
+    return ec->pctx && ec->pctx->spill &&
+           atomic_load_explicit(&ec->pctx->spill_mode, memory_order_acquire) != 0;
+}
+
+CBMFileResult *cbm_pipeline_result_acquire(const cbm_pipeline_ctx_t *ctx, CBMFileResult **cache,
+                                           int i, cbm_result_want_fn want, bool *loaded) {
+    *loaded = false;
+    if (cache && cache[i]) {
+        return (!want || want(cache[i])) ? cache[i] : NULL;
+    }
+    if (!ctx || !ctx->spill || !cbm_result_spill_has(ctx->spill, i)) {
+        return NULL;
+    }
+    if (want) {
+        CBMFileResult hdr;
+        if (!cbm_result_spill_peek_header(ctx->spill, i, &hdr) || !want(&hdr)) {
+            return NULL;
+        }
+    }
+    CBMFileResult *r = cbm_result_spill_load(ctx->spill, i);
+    *loaded = r != NULL;
+    return r;
+}
+
+void cbm_pipeline_result_release(CBMFileResult *r, bool loaded) {
+    if (r && loaded) {
+        cbm_free_result(r);
+    }
+}
+
+void cbm_pipeline_spill_close(cbm_pipeline_ctx_t *ctx) {
+    if (!ctx || !ctx->spill) {
+        return;
+    }
+    int64_t parked = 0;
+    int64_t bytes = 0;
+    int64_t loads = 0;
+    cbm_result_spill_stats(ctx->spill, &parked, &bytes, &loads);
+    cbm_log_info("mem.spill.done", "parked", itoa_log((int)parked), "mb",
+                 itoa_log((int)(bytes / (1024 * 1024))), "loads", itoa_log((int)loads));
+    cbm_result_spill_close(ctx->spill);
+    ctx->spill = NULL;
+    atomic_store_explicit(&ctx->spill_mode, 0, memory_order_release);
+    cbm_work_arena_release();
+}
+
+/* Park every cached result that is complete. Slots are claimed 1 -> 2 so two
+ * workers never park the same result; a failed park hands the slot back. */
+/* True while a cached (not yet parked) result exists or a sweep is running:
+ * memory can still come down without anyone napping. */
+static bool pp_spill_work_remains(const extract_ctx_t *ec) {
+    if (!ec->slot_state) {
+        return false;
+    }
+    if (atomic_load_explicit(&ec->spill_sweeps_running, memory_order_acquire) > 0) {
+        return true;
+    }
+    for (int i = 0; i < ec->file_count; i++) {
+        if (atomic_load_explicit(&ec->slot_state[i], memory_order_relaxed) == 1) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int pp_spill_sweep(extract_ctx_t *ec, int worker_id) {
+    if (!pp_spill_active(ec) || !ec->slot_state) {
+        return 0;
+    }
+    atomic_fetch_add_explicit(&ec->spill_sweeps_running, 1, memory_order_acq_rel);
+    int parked = 0;
+    for (int i = 0; i < ec->file_count; i++) {
+        if (atomic_load_explicit(&ec->over_budget_abort, memory_order_relaxed)) {
+            break;
+        }
+        uint8_t expected = 1;
+        if (!atomic_compare_exchange_strong_explicit(&ec->slot_state[i], &expected, (uint8_t)2,
+                                                     memory_order_acq_rel, memory_order_relaxed)) {
+            continue;
+        }
+        CBMFileResult *r = ec->result_cache[i];
+        if (r && cbm_result_spill_park(ec->pctx->spill, worker_id, i, r)) {
+            ec->result_cache[i] = NULL;
+            parked++;
+            if ((parked & 255) == 0) {
+                cbm_mem_release_to_os();
+            }
+        } else {
+            atomic_store_explicit(&ec->slot_state[i], (uint8_t)1, memory_order_release);
+        }
+    }
+    if (parked > 0) {
+        cbm_mem_release_to_os();
+        cbm_log_info("mem.spill.sweep", "parked", itoa_log(parked), "charged_mb",
+                     itoa_log((int)(cbm_mem_charged() / ((size_t)1024 * 1024))));
+    }
+    atomic_fetch_sub_explicit(&ec->spill_sweeps_running, 1, memory_order_acq_rel);
+    return parked;
+}
+
+/* Diagnostic (CBM_MEM_PHASES=1): where does the charge go between the
+ * near-budget latch and the first over-budget observation? One line per
+ * 256 MB step of the charge above its last logged value while spill mode is
+ * on, and one at the first over-budget observation, each with the
+ * footprint / commit / tracked breakdown and the class table. */
+static _Atomic size_t g_probe_last_mb = 0;
+static _Atomic int g_probe_over_logged = 0;
+static void pp_charge_probe(extract_ctx_t *ec, bool over) {
+    if (!cbm_mem_phases_enabled() || !pp_spill_active(ec)) {
+        return;
+    }
+    enum { PROBE_STEP_MB = 256, PROBE_MB = 1024 * 1024 };
+    size_t charged_mb = cbm_mem_charged() / PROBE_MB;
+    size_t last = atomic_load_explicit(&g_probe_last_mb, memory_order_relaxed);
+    bool step = charged_mb >= last + PROBE_STEP_MB &&
+                atomic_compare_exchange_strong_explicit(&g_probe_last_mb, &last, charged_mb,
+                                                        memory_order_relaxed, memory_order_relaxed);
+    bool first_over =
+        over && atomic_exchange_explicit(&g_probe_over_logged, 1, memory_order_relaxed) == 0;
+    if (!step && !first_over) {
+        return;
+    }
+    cbm_log_info("mem.charge.probe", "event", first_over ? "first_over" : "step", "charged_mb",
+                 itoa_log((int)charged_mb), "footprint_mb",
+                 itoa_log((int)(cbm_mem_footprint() / PROBE_MB)), "commit_mb",
+                 itoa_log((int)(cbm_mem_allocator_committed() / PROBE_MB)), "tracked_mb",
+                 itoa_log((int)(cbm_mem_tracked_live_bytes() / PROBE_MB)));
+    cbm_mem_class_log(first_over ? "charge.first_over" : "charge.step");
+}
+
 static void extract_worker(int worker_id, void *ctx_ptr) {
     extract_ctx_t *ec = ctx_ptr;
     extract_worker_state_t *ws = &ec->workers[worker_id];
 
     /* Lazy gbuf creation */
     if (!ws->local_gbuf) {
-        ws->local_gbuf = cbm_gbuf_new_shared_ids(ec->project_name, ec->repo_path, ec->shared_ids);
+        ws->local_gbuf = cbm_gbuf_new_worker(ec->project_name, ec->repo_path, ec->shared_ids);
     }
 
     /* Pull files from shared atomic counter */
@@ -738,7 +979,8 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
             break;
         }
         cbm_scale_tick(&ec->scale, sort_pos);
-        if (atomic_load_explicit(ec->cancelled, memory_order_relaxed)) {
+        if (atomic_load_explicit(ec->cancelled, memory_order_relaxed) ||
+            atomic_load_explicit(&ec->over_budget_abort, memory_order_relaxed)) {
             break;
         }
 
@@ -749,38 +991,75 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
          * near the budget instead of letting all workers parse their biggest
          * files at once. Self-disabling when the budget is unset (tests) or RSS
          * is under budget; bounded spins avoid deadlock when the resident graph
-         * is itself near budget (then proceed with a soft overshoot).
+         * is itself near budget.
          *
          * Futility latch: when a FULL nap cycle ends still over budget, the
          * resident floor — not transients — holds the memory; napping again on
          * the next pull cannot reclaim it and only idles workers (linux kernel:
-         * one full cycle per pull ≈ 390 s at 79% avg CPU). Latch bp_futile and
-         * proceed with the soft overshoot; the over-budget probe below re-arms
-         * the gate as soon as RSS drains under budget. */
+         * one full cycle per pull ≈ 390 s at 79% avg CPU). The worker that
+         * latches bp_futile (0→1) runs ONE confirmation cycle while its peers
+         * skip the nap. A confirmation that ends under budget re-arms the gate
+         * (RSS drained after all); one that still ends over budget fails the
+         * attempt whole (decision A, #1997 #832): every worker stops pulling,
+         * extract returns CBM_PIPELINE_ABORT_OVER_BUDGET, nothing is published
+         * and the previously serving index keeps answering. */
         if (cbm_mem_budget() > 0) {
             bool over = cbm_mem_over_budget();
+            pp_charge_probe(ec, over);
+            /* Anticipation: the gate sees the crossing per file pull, and the
+             * workers' in-flight files carry the charge past the line before
+             * the first sweep lands (kernel, 15 GB budget: high-water 15.65
+             * GB, 4% over, all of it set in that window). Spill mode is
+             * entered PP_SPILL_EARLY_DIV-th short of the budget, so results
+             * stop accumulating in memory while the headroom still covers the
+             * in-flight work. The nap / futility path still keys on the
+             * budget itself. */
+            if (!over && !pp_spill_active(ec)) {
+                size_t budget = cbm_mem_budget();
+                if (cbm_mem_charged() > budget - budget / PP_SPILL_EARLY_DIV) {
+                    pp_spill_enter(ec, "near_budget");
+                }
+            }
+            bool settling = false;
+            if (over) {
+                /* Admission control, first response: park what can be parked.
+                 * Only what is still over budget after that -- the floor --
+                 * reaches the nap / futility / abort path below, and only
+                 * once nothing is left to park anywhere. */
+                pp_spill_enter(ec, "over_budget");
+                int parked = pp_spill_sweep(ec, worker_id);
+                over = cbm_mem_over_budget();
+                if (over && pp_spill_active(ec) && (parked > 0 || pp_spill_work_remains(ec))) {
+                    over = false; /* memory is still on its way down */
+                    settling = true;
+                }
+            }
             bool futile = atomic_load_explicit(&ec->bp_futile, memory_order_relaxed) != 0;
             if (over && !futile) {
-                cbm_mem_collect();
-                atomic_fetch_add_explicit(&g_bp_nap_cycles, SKIP_ONE, memory_order_relaxed);
-                int bp = 0;
-                for (; bp < PP_BACKPRESSURE_MAX_SPINS && cbm_mem_over_budget() &&
-                       !atomic_load_explicit(ec->cancelled, memory_order_relaxed);
-                     bp++) {
-                    struct timespec nap = {0, PP_BACKPRESSURE_NAP_NS};
-                    cbm_nanosleep(&nap, NULL);
-                }
-                if (bp == PP_BACKPRESSURE_MAX_SPINS && cbm_mem_over_budget()) {
-                    /* Log only the 0→1 transition: all workers race into the
-                     * gate before anyone latches, so a plain store would WARN
-                     * once per worker (12 lines per latch event). */
-                    if (atomic_exchange_explicit(&ec->bp_futile, 1, memory_order_relaxed) == 0) {
-                        cbm_log_warn("mem.backpressure.futile", "action", "soft_overshoot");
+                /* Act only on the 0→1 transition: all workers race into the
+                 * gate before anyone latches, so a plain store would confirm
+                 * (and WARN) once per worker. */
+                if (pp_backpressure_cycle_still_over(ec) &&
+                    atomic_exchange_explicit(&ec->bp_futile, 1, memory_order_relaxed) == 0) {
+                    cbm_log_warn("mem.backpressure.futile", "action", "confirm");
+                    if (pp_backpressure_cycle_still_over(ec)) {
+                        pp_fail_whole_over_budget(ec);
+                    } else {
+                        atomic_store_explicit(&ec->bp_futile, 0, memory_order_relaxed);
                     }
                 }
-            } else if (!over && futile) {
+            } else if (!over && !settling && futile) {
+                /* Re-arm only on a genuine under-budget reading. A reading the
+                 * spill shortcut produced ("still on its way down") is not
+                 * one: re-arming on it made the next over-budget pull pay a
+                 * full nap cycle again -- the gate re-paid per pull that
+                 * pipeline_backpressure_futile_nap_disengages guards against
+                 * (TSan lane on PR #2202: 8 cycles against a bound of 7). */
                 atomic_store_explicit(&ec->bp_futile, 0, memory_order_relaxed);
             }
+        }
+        if (atomic_load_explicit(&ec->over_budget_abort, memory_order_relaxed)) {
+            break;
         }
 
         int file_idx = ec->sorted[sort_pos].idx;
@@ -800,8 +1079,9 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
             if (!phase) {
                 phase = "crash";
             }
-            const char *reason =
-                (strcmp(phase, "hang") == 0) ? "quarantined after hang" : "quarantined after crash";
+            const char *reason = (strcmp(phase, "hang") == 0)    ? "quarantined after hang"
+                                 : (strcmp(phase, "error") == 0) ? "quarantined after error"
+                                                                 : "quarantined after crash";
             pp_err_add(errs, fi->rel_path, reason, phase);
             ws->errors++;
             continue;
@@ -887,11 +1167,12 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         } else if (result->parse_incomplete) {
             /* Best-effort parse-coverage signal (#963): the file WAS indexed,
              * but its tree contains ERROR/MISSING regions whose constructs are
-             * silently absent from the graph. Not a skip — recorded under the
-             * distinct "parse_partial" phase (reason = the line-range list) so
-             * the MCP layer reports it separately from skipped[]. */
+             * silently absent from the graph. Neither phase is a skip — both
+             * are recorded separately from skipped[] by the MCP layer.
+             * "parse_unusable" means one range covers so much of the file that
+             * naming the lines helps nobody; see parse_unusable in cbm.h. */
             pp_err_add(errs, fi->rel_path, result->error_ranges ? result->error_ranges : "unknown",
-                       "parse_partial");
+                       result->parse_unusable ? "parse_unusable" : "parse_partial");
         }
 
         /* Create definition nodes in local gbuf */
@@ -959,8 +1240,24 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
          * and the retention copy (if any) lives in result->arena. */
         free_source(source);
 
-        /* Cache result (arena + extracted data, no tree) for Phase 3B and Phase 4 */
-        ec->result_cache[file_idx] = result;
+        /* Everything this file will ever contribute has been written; drop
+         * the working arena (node-text copies, abandoned array generations)
+         * and keep only the reachable result. See cbm_result_compact. */
+        cbm_result_compact(result);
+
+        /* Cache result (arena + extracted data, no tree) for Phase 3B and
+         * Phase 4 -- or park it straight to disk in spill mode. */
+        if (pp_spill_active(ec) &&
+            cbm_result_spill_park(ec->pctx->spill, worker_id, file_idx, result)) {
+            if (ec->slot_state) {
+                atomic_store_explicit(&ec->slot_state[file_idx], (uint8_t)2, memory_order_release);
+            }
+        } else {
+            ec->result_cache[file_idx] = result;
+            if (ec->slot_state) {
+                atomic_store_explicit(&ec->slot_state[file_idx], (uint8_t)1, memory_order_release);
+            }
+        }
 
         /* Progress logging: log every 10 files (atomic read, no contention) */
         if ((sort_pos + SKIP_ONE) % PP_LOG_INTERVAL == 0 || sort_pos + SKIP_ONE == ec->file_count) {
@@ -986,6 +1283,7 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
     }
 
     /* Final cleanup (parser already destroyed in loop, just slab state) */
+    cbm_work_arena_release(); /* the working arena kept between files */
     cbm_slab_destroy_thread();
     cbm_kind_in_set_free_cache(); /* free this worker thread's node-type bitset cache */
 }
@@ -1112,6 +1410,8 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         .result_cache = result_cache,
         .shared_ids = shared_ids,
         .cancelled = ctx->cancelled,
+        .pctx = ctx,
+        .slot_state = NULL,
         .pkg_entries = pkg_entries,
         .err_lists = err_lists,
         .retain_sources = resolved_opts.retain_sources,
@@ -1126,12 +1426,44 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     atomic_init(&ec.retain_cap_warned, 0);
     atomic_init(&ec.oversized_warned, 0);
     atomic_init(&ec.bp_futile, 0);
+    atomic_init(&ec.over_budget_abort, 0);
+    atomic_init(&ec.spill_sweeps_running, 0);
+    atomic_init(&ec.spill_unavailable, 0);
+    cbm_mutex_init(&ec.spill_mu);
+    ec.slot_state = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)file_count * sizeof(_Atomic uint8_t));
+    ec.spill_env = pp_spill_env_read();
+    if (pp_spill_forced_by_env(&ec)) {
+        pp_spill_enter(&ec, "env");
+    }
 
     /* Sub-phase: Dispatch workers (parse + extract per file, PARALLEL) */
     CBM_PROF_START(t_dispatch);
     cbm_parallel_for_opts_t parallel_opts = {.max_workers = worker_count, .force_pthreads = false};
     cbm_scale_begin(&ec.scale, "parallel_extract", (long)file_count);
     cbm_parallel_for(worker_count, extract_worker, &ec, parallel_opts);
+    if (pp_spill_active(&ec) &&
+        !atomic_load_explicit(&ec.over_budget_abort, memory_order_relaxed)) {
+        /* Spill mode was entered, so results belong on disk: park every
+         * result still cached before the phases that cannot park (registry
+         * build, resolve, the semantic pass) inherit them. The sweeps above
+         * run only on an over-budget observation; a run that latched early
+         * and then stayed under budget through extraction (kernel, 15 GB,
+         * 2026-09-14: 14,949 MB at this point, 44,797 results = 8 GB still
+         * cached) reached resolve with no headroom and aborted there. */
+        int parked = pp_spill_sweep(&ec, 0);
+        cbm_log_info("mem.spill.final_sweep", "parked", itoa_log(parked), "charged_mb",
+                     itoa_log((int)(cbm_mem_charged() / ((size_t)1024 * 1024))));
+    }
+    if (ctx->spill) {
+        int64_t parked = 0;
+        int64_t bytes = 0;
+        cbm_result_spill_stats(ctx->spill, &parked, &bytes, NULL);
+        cbm_log_info("mem.spill.extract_done", "parked", itoa_log((int)parked), "mb",
+                     itoa_log((int)(bytes / (1024 * 1024))));
+    }
+    cbm_mutex_destroy(&ec.spill_mu);
+    cbm_free(CBM_MEM_CLASS_OTHER, ec.slot_state);
+    ec.slot_state = NULL;
     cbm_scale_end(&ec.scale);
     CBM_PROF_END_N("parallel_extract", "3_dispatch_workers_parallel", t_dispatch, file_count);
 
@@ -1173,6 +1505,12 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     free(sorted);
     cbm_macro_table_free(pp_macro_table); /* ObjectScript macro table (NULL-safe) */
 
+    /* The over-budget verdict outranks the cancel sentinel: a caller must be
+     * able to name the cause, and the orchestrator discards the staging DB on
+     * every non-zero code alike (the live generation is never touched). */
+    if (atomic_load(&ec.over_budget_abort)) {
+        return CBM_PIPELINE_ABORT_OVER_BUDGET;
+    }
     if (atomic_load(ctx->cancelled)) {
         return CBM_NOT_FOUND;
     }
@@ -1325,6 +1663,11 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         }
 
         CBMFileResult *result = result_cache[i];
+        bool loaded = false;
+        if (!result && ctx->spill && cbm_result_spill_has(ctx->spill, i)) {
+            result = cbm_result_spill_load(ctx->spill, i);
+            loaded = result != NULL;
+        }
         if (!result) {
             continue;
         }
@@ -1339,6 +1682,9 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         imports_edges += create_imports_edges(ctx, result, rel, namespace_map);
         create_channel_edges(ctx, result, rel);
         cbm_pipeline_create_env_configures_for_file(ctx, result, rel);
+        if (loaded) {
+            cbm_free_result(result);
+        }
     }
 
     cbm_pipeline_namespace_map_free(namespace_map);
@@ -1361,7 +1707,8 @@ typedef struct __attribute__((aligned(CBM_CACHE_LINE))) {
      * registry's textual matcher. Surfaced in the parallel.resolve.done
      * log line so divergence between pipelines becomes observable. */
     int lsp_overrides;
-    char _pad[CBM_CACHE_LINE - sizeof(cbm_gbuf_t *) - ((PP_RING + 1) * sizeof(int))];
+    CBMFileResult *loaded; /* spill-loaded result this worker is using */
+    char _pad[CBM_CACHE_LINE - 2 * sizeof(void *) - ((PP_RING + 1) * sizeof(int))];
 } resolve_worker_state_t;
 
 typedef struct {
@@ -1397,6 +1744,11 @@ typedef struct {
      * cbm_run_X_lsp_cross_with_registry — skip per-file build entirely.
      * Stored as CBMCrossLspRegistries* (typedef from pass_lsp_cross.h). */
     CBMCrossLspRegistries *cross_registries;
+
+    /* Parsed once on the coordinator thread and borrowed read-only by resolve
+     * workers.  The pointer is installed into each worker's TLS slot so Rust's
+     * manifest-aware cross-file resolver sees the same Cargo context. */
+    const CBMCargoManifest *rust_manifest;
 
     /* F4: LAZILY-built shared Rust registry (built ONCE, on the first NULL-filter
      * rust file — the ~all_defs amplifier files). Not eager: repos whose rust files
@@ -1444,6 +1796,7 @@ typedef struct {
      * necessary (#1669: 87% of a Java index), so it is the one that must never
      * again grow superlinear without saying so. */
     cbm_scale_probe_t scale;
+    cbm_pipeline_ctx_t *pctx; /* spill store access */
 } resolve_ctx_t;
 
 /* Minimum buffer space needed per arg JSON object */
@@ -1785,12 +2138,22 @@ static void detect_url_in_args(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                                const CBMCall *call) {
     for (int ai = 0; ai < call->arg_count; ai++) {
         const CBMCallArg *ca = &call->args[ai];
+        /* A slash-prefixed raw expression is not a URL string. In JS/TS this
+         * is notably a regex literal (`/<table/i`); genuine string literals
+         * and propagated constants are carried in `value`, while template
+         * literals keep their leading backtick in `expr`. */
+        if (!ca->value && ca->expr && ca->expr[0] == '/') {
+            continue;
+        }
         const char *url = ca->value ? ca->value : ca->expr;
         if (!url || (url[0] != '/' && url[0] != '`')) {
             continue;
         }
         char norm[CBM_SZ_256];
         if (!normalize_url_arg(url, norm, (int)sizeof(norm))) {
+            continue;
+        }
+        if (!cbm_service_pattern_is_http_route_literal(norm, call->callee_name)) {
             continue;
         }
         char route_qn[CBM_ROUTE_QN_SIZE];
@@ -1941,10 +2304,12 @@ static void emit_graphql_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, c
         cbm_gbuf_upsert_node(gbuf, "Route", p, route_qn, "", 0, 0, "{\"source\":\"graphql\"}");
 
     char esc_c[CBM_SZ_256];
+    char esc_op[CBM_SZ_512];
     cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
+    cbm_json_escape(esc_op, sizeof(esc_op), p);
     char props[CBM_SZ_1K];
     snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"operation\":\"%s\",\"confidence\":%.2f}",
-             esc_c, p, res->confidence);
+             esc_c, esc_op, res->confidence);
     cbm_gbuf_insert_edge(gbuf, source->id, route_id, "GRAPHQL_CALLS", props);
 }
 
@@ -2456,20 +2821,30 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             continue;
         }
 
-        /* TS/JS/TSX weak-method suppression (#592/#606). The receiver-aware guard
-         * must NOT drop this call here: doing so would also skip the #523
-         * callee-name service bypass below, emit_service_edge's route/gRPC/config
-         * branches, and its unconditional detect_url_in_args (which classifies
-         * verb-suffix HTTP clients like api.patch('/x')). Instead, defer to the
-         * emit path and suppress ONLY the plain-CALLS fall-through
-         * (emit_normal_calls_edge), so every service edge stays main-identical by
-         * construction. res.strategy may carry an lsp_* value here (LSP-resolved
-         * calls keep res through this point); the helper's EXPLICIT drop-list
-         * leaves lsp_ts_method / lsp_cross untouched. See #606 direction. */
-        bool is_tsjs =
-            lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX;
-        bool tsjs_drop_plain_call =
-            cbm_tsjs_suppress_weak_method_match(is_tsjs, call->is_method, res.strategy);
+        /* Dynamic-language weak-member suppression (#592/#606/#1276). The
+         * receiver-aware guard must NOT drop this call here: doing so would also
+         * skip the #523 callee-name service bypass below, emit_service_edge's
+         * route/gRPC/config branches, and its unconditional detect_url_in_args
+         * (which classifies verb-suffix HTTP clients like api.patch('/x')).
+         * Instead, defer to the emit path and suppress ONLY the plain-CALLS
+         * fall-through (emit_normal_calls_edge), so every service edge stays
+         * main-identical by construction. res.strategy may carry an lsp_* value
+         * here (LSP-resolved calls keep res through this point); the helper's
+         * EXPLICIT drop-list leaves lsp_ts_method / lsp_cross untouched. See
+         * #606 direction.
+         *
+         * This language set MUST match the one in pass_calls.c exactly — see the
+         * note there. ArkTS belongs to the JS/TS family (#1842). */
+        bool suppress_weak_member = lang == CBM_LANG_PYTHON || lang == CBM_LANG_JAVASCRIPT ||
+                                    lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
+                                    lang == CBM_LANG_ARKTS;
+        /* Bare-call local-binding suppression — see the note in pass_calls.c.
+         * This gate MUST stay identical to the one there. */
+        bool suppress_weak_local_binding = lang == CBM_LANG_PYTHON;
+        bool drop_plain_call =
+            cbm_suppress_weak_member_match(suppress_weak_member, call->is_method, res.strategy) ||
+            cbm_suppress_weak_local_binding_call(suppress_weak_local_binding,
+                                                 call->callee_is_locally_bound, res.strategy);
 
         /* Service-pattern HTTP/ASYNC client call (`requests.get(url)`): the
          * service signal lives in the callee_name. The registry can mis-resolve
@@ -2564,7 +2939,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         _rc_t0 = extract_now_ns();
         emit_service_edge(ws->local_edge_buf, source_node, target_node, call, &res, module_qn,
                           rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count,
-                          tsjs_drop_plain_call);
+                          drop_plain_call);
         atomic_fetch_add_explicit(&rc->time_ns_rc_emit, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
         ws->calls_resolved++;
@@ -2640,6 +3015,18 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                 continue;
             }
             tgt = cbm_gbuf_find_by_qn(rc->main_gbuf, res.qualified_name);
+            /* #1928: the registry fallback is a bare-name guess — never let it
+             * bind a reference across a language boundary. Mirrors the
+             * sequential twin (pass_usages.c). */
+            if (tgt && cbm_suppress_cross_language_ref(lang, tgt->file_path)) {
+                continue;
+            }
+            /* #1942/#1962: a bare Go reference can never denote a struct
+             * field; the member half of a selector may. */
+            if (tgt && cbm_go_suppress_bare_field_ref(lang == CBM_LANG_GO, usage->is_member_access,
+                                                      tgt->label)) {
+                continue;
+            }
             if (usage->semantic_reference_blocked && (usage->semantic_reference_local_shadow ||
                                                       cbm_pipeline_node_is_callable_target(tgt))) {
                 continue;
@@ -2699,7 +3086,7 @@ static void resolve_file_throws(resolve_ctx_t *rc, resolve_worker_state_t *ws,
 /* Resolve reads/writes for one file. */
 static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFileResult *result,
                             const char *rel, const char *module_qn, const char **imp_keys,
-                            const char **imp_vals, int imp_count) {
+                            const char **imp_vals, int imp_count, CBMLanguage lang) {
     for (int r = 0; r < result->rw.count; r++) {
         CBMReadWrite *rw = &result->rw.items[r];
         if (!rw->var_name) {
@@ -2717,6 +3104,17 @@ static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFi
         }
         const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn(rc->main_gbuf, res.qualified_name);
         if (!tgt || src->id == tgt->id) {
+            continue;
+        }
+        /* #1928: every resolution here is a bare-name registry guess — never
+         * let it bind a read/write across a language boundary. Mirrors the
+         * sequential twin (pass_usages.c). */
+        if (cbm_suppress_cross_language_ref(lang, tgt->file_path)) {
+            continue;
+        }
+        /* #1942/#1962: a bare Go reference can never denote a struct field;
+         * a selector-LHS write (`t.err = x`) may bind it. */
+        if (cbm_go_suppress_bare_field_ref(lang == CBM_LANG_GO, rw->is_member_access, tgt->label)) {
             continue;
         }
         const char *etype = rw->is_write ? "WRITES" : "READS";
@@ -2942,9 +3340,10 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
     resolve_ctx_t *rc = ctx_ptr;
     resolve_worker_state_t *ws = &rc->workers[worker_id];
 
+    cbm_pxc_set_rust_manifest(rc->rust_manifest);
+
     if (!ws->local_edge_buf) {
-        ws->local_edge_buf =
-            cbm_gbuf_new_shared_ids(rc->project_name, rc->repo_path, rc->shared_ids);
+        ws->local_edge_buf = cbm_gbuf_new_worker(rc->project_name, rc->repo_path, rc->shared_ids);
     }
 
     /* Per-worker service-pattern result cache. The same resolved QN
@@ -2968,7 +3367,16 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
 
         uint64_t _loop_t0 = extract_now_ns();
 
+        if (ws->loaded) {
+            cbm_free_result(ws->loaded);
+            ws->loaded = NULL;
+        }
         CBMFileResult *result = rc->result_cache[file_idx];
+        if (!result && rc->pctx && rc->pctx->spill &&
+            cbm_result_spill_has(rc->pctx->spill, file_idx)) {
+            result = cbm_result_spill_load(rc->pctx->spill, file_idx);
+            ws->loaded = result;
+        }
         if (!result) {
             atomic_fetch_add_explicit(&rc->time_ns_total_loop, extract_now_ns() - _loop_t0,
                                       memory_order_relaxed);
@@ -3007,6 +3415,8 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
          * a mixed-source-root Java↔Kotlin site remains unresolved, so JVM
          * callers run whenever either kind of site exists. */
         bool jvm_cross_lsp = (lang == CBM_LANG_JAVA || lang == CBM_LANG_KOTLIN);
+        bool rust_workspace_cross_lsp =
+            (lang == CBM_LANG_RUST && rc->rust_manifest && rc->rust_manifest->member_count > 0);
         int call_reference_sites = pp_call_reference_site_count(result, lang);
         int semantic_sites = result->calls.count + call_reference_sites;
         int qualified_lsp_sites = pp_qualified_lsp_site_count(result);
@@ -3014,7 +3424,8 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         bool cross_lsp_eligible =
             (rc->all_defs && rc->def_count > 0 && cbm_pxc_has_cross_lsp(lang) &&
              (semantic_sites > 0 || pending_lsp_site) &&
-             (jvm_cross_lsp || pending_lsp_site || qualified_lsp_sites < semantic_sites) &&
+             (jvm_cross_lsp || rust_workspace_cross_lsp || pending_lsp_site ||
+              qualified_lsp_sites < semantic_sites) &&
              !is_generated);
 
         /* Skip files with nothing else to resolve and no cross-LSP work. */
@@ -3160,7 +3571,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
 
         /* ── READS / WRITES ────────────────────────────────────── */
         _ph_t0 = extract_now_ns();
-        resolve_file_rw(rc, ws, result, rel, module_qn, imp_keys, imp_vals, imp_count);
+        resolve_file_rw(rc, ws, result, rel, module_qn, imp_keys, imp_vals, imp_count, lang);
         atomic_fetch_add_explicit(&rc->time_ns_rw, extract_now_ns() - _ph_t0, memory_order_relaxed);
 
         /* ── INHERITS + DECORATES + IMPLEMENTS ──────────────────── */
@@ -3185,6 +3596,11 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
      * into dead TLS and are never retired, so a later cross-thread free can
      * never bring their refcount to zero (leak). Retiring them here releases
      * each page as its final chunk returns. */
+    if (ws->loaded) {
+        cbm_free_result(ws->loaded);
+        ws->loaded = NULL;
+    }
+    cbm_pxc_set_rust_manifest(NULL);
     cbm_destroy_thread_parser();
     cbm_slab_destroy_thread();
     cbm_service_pattern_cache_end();
@@ -3211,7 +3627,28 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     }
     memset(workers, 0, (size_t)worker_count * sizeof(resolve_worker_state_t));
 
+    bool have_rust = false;
+    for (int i = 0; i < file_count; i++) {
+        if (files[i].language == CBM_LANG_RUST &&
+            (result_cache[i] || (ctx->spill && cbm_result_spill_has(ctx->spill, i)))) {
+            have_rust = true;
+            break;
+        }
+    }
+    CBMArena rust_manifest_arena;
+    CBMCargoManifest rust_manifest;
+    bool rust_manifest_arena_live = false;
+    const CBMCargoManifest *rust_manifest_ptr = NULL;
+    if (have_rust) {
+        cbm_arena_init(&rust_manifest_arena);
+        rust_manifest_arena_live = true;
+        if (cbm_pxc_build_rust_manifest(ctx, &rust_manifest_arena, &rust_manifest)) {
+            rust_manifest_ptr = &rust_manifest;
+        }
+    }
+
     resolve_ctx_t rc = {
+        .pctx = ctx,
         .files = files,
         .file_count = file_count,
         .project_name = ctx->project_name,
@@ -3228,6 +3665,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         .def_modules = def_modules,
         .module_def_index = module_def_index,
         .cross_registries = cross_registries,
+        .rust_manifest = rust_manifest_ptr,
     };
     atomic_init(&rc.next_file_idx, 0);
     atomic_init(&rc.lsp_cross_processed, 0);
@@ -3253,6 +3691,9 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         rc.rust_shared_arena_live = false;
     }
     cbm_mutex_destroy(&rc.rust_shared_mu);
+    if (rust_manifest_arena_live) {
+        cbm_arena_destroy(&rust_manifest_arena);
+    }
 
     /* Sub-phase: Merge all local edge bufs into main gbuf (SEQUENTIAL) */
     CBM_PROF_START(t_resolve_merge);

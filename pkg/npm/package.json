@@ -1,16 +1,16 @@
 {
   "name": "codebase-memory-mcp",
-  "version": "0.8.1",
+  "version": "0.11.1",
   "description": "Fast code intelligence for AI coding agents — installs a verified native runtime set",
-  "mcpName": "io.github.DeusData/codebase-memory-mcp",
+  "mcpName": "io.github.Be90nia/codebase-memory-mcp-pro",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/DeusData/codebase-memory-mcp.git"
+    "url": "git+https://github.com/Be90nia/codebase-memory-mcp-pro.git"
   },
-  "homepage": "https://github.com/DeusData/codebase-memory-mcp",
+  "homepage": "https://github.com/Be90nia/codebase-memory-mcp-pro",
   "bugs": {
-    "url": "https://github.com/DeusData/codebase-memory-mcp/issues"
+    "url": "https://github.com/Be90nia/codebase-memory-mcp-pro/issues"
   },
   "keywords": [
     "mcp",

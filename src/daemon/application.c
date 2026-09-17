@@ -14,6 +14,7 @@
 #include "foundation/secure_random.h"
 #include "foundation/sha256.h"
 #include "foundation/subprocess.h"
+#include "foundation/workspace.h"
 #include "mcp/index_supervisor.h"
 #include "mcp/mcp.h"
 #include "mcp/mcp_internal.h"
@@ -180,7 +181,7 @@ struct cbm_daemon_application {
     cbm_daemon_application_update_ops_t update_ops;
     cbm_project_lock_manager_t *project_locks;
     size_t physical_job_limit;
-    size_t worker_memory_budget_bytes;
+    size_t aggregate_memory_budget_bytes;
     size_t active_mutations;
     size_t update_owners;
     cbm_daemon_application_update_worker_t update_worker;
@@ -373,6 +374,11 @@ static bool application_regular_db_exists(const char *project) {
     return stat(path, &status) == 0 && S_ISREG(status.st_mode);
 }
 
+static bool application_canonical_directory_exists(const char *path) {
+    cbm_path_info_t info = {0};
+    return cbm_path_info_utf8(path, &info) == 0 && info.is_directory;
+}
+
 static cbm_daemon_application_watch_t *application_find_watch_locked(
     cbm_daemon_application_t *application, const char *project) {
     for (cbm_daemon_application_watch_t *watch = application->watches; watch; watch = watch->next) {
@@ -429,6 +435,22 @@ static void application_release_session_watch_locked(cbm_daemon_application_sess
     }
 }
 
+static bool application_session_workspace_allowed(const cbm_daemon_application_session_t *session,
+                                                  const char *operation) {
+    const char *root = session ? cbm_mcp_server_session_root(session->mcp) : NULL;
+    char boundary_error[CBM_SZ_1K];
+    bool allowed =
+        root && root[0] &&
+        cbm_workspace_root_allowed(root, cbm_workspace_home_dir(), cbm_workspace_cache_dir(),
+                                   cbm_mcp_server_allowed_root(session->mcp), boundary_error,
+                                   sizeof(boundary_error));
+    if (!allowed) {
+        cbm_log_warn("daemon.workspace.skipped", "operation", operation, "detail",
+                     root && root[0] ? boundary_error : "session root is unavailable");
+    }
+    return allowed;
+}
+
 /* Caller holds application->mutex. */
 static void application_refresh_watch_locked(cbm_daemon_application_session_t *session) {
     cbm_daemon_application_t *application = session->application;
@@ -440,6 +462,10 @@ static void application_refresh_watch_locked(cbm_daemon_application_session_t *s
     const char *project = cbm_mcp_server_session_project(session->mcp);
     const char *root = cbm_mcp_server_session_root(session->mcp);
     if (!project || !project[0] || !root || !root[0]) {
+        return;
+    }
+    if (!application_session_workspace_allowed(session, "watch")) {
+        application_release_session_watch_locked(session);
         return;
     }
     bool enabled = !application->config ||
@@ -613,7 +639,8 @@ static bool application_unique_recovery_file(char out[APPLICATION_PATH_CAP], con
     int written;
     if (application_cache_dir(cache)) {
         written = snprintf(directory, sizeof(directory), "%s/logs", cache);
-        if (written <= 0 || written >= (int)sizeof(directory) || !cbm_mkdir_p(directory, 0700)) {
+        if (written <= 0 || written >= (int)sizeof(directory) ||
+            !cbm_mkdir_p_ex(directory, 0700, CBM_MKDIR_FOLLOW_OWNED)) {
             return false;
         }
     } else {
@@ -667,6 +694,8 @@ static bool application_truncate_file(const char *path) {
 }
 
 static bool application_job_cancel_requested(cbm_daemon_application_job_t *job);
+static size_t application_worker_memory_slice_locked(cbm_daemon_application_t *application,
+                                                     size_t *active_jobs_out);
 
 static char **application_read_suspects(cbm_daemon_application_job_t *job, const char *path,
                                         int *count_out, bool *cancelled_out) {
@@ -1062,11 +1091,33 @@ static application_attempt_status_t application_job_run_attempt(cbm_daemon_appli
         return APPLICATION_ATTEMPT_CANCELLED;
     }
 
+    /* Decision 2 (#1997 #832): the slice is decided at spawn time from the jobs
+     * active right now (this job included), so a lone worker may use the whole
+     * aggregate and concurrent jobs split it. The divisor is logged so a
+     * fail-whole verdict can be read against the budget the worker really had. */
+    size_t active_jobs = 0;
+    cbm_mutex_lock(&application->mutex);
+    size_t memory_budget_bytes = application_worker_memory_slice_locked(application, &active_jobs);
+    size_t aggregate_memory_budget_bytes = application->aggregate_memory_budget_bytes;
+    cbm_mutex_unlock(&application->mutex);
+    if (memory_budget_bytes > 0) {
+        char active_text[32];
+        char aggregate_text[32];
+        char slice_text[32];
+        (void)snprintf(active_text, sizeof(active_text), "%zu", active_jobs);
+        (void)snprintf(aggregate_text, sizeof(aggregate_text), "%zu",
+                       aggregate_memory_budget_bytes / (1024U * 1024U));
+        (void)snprintf(slice_text, sizeof(slice_text), "%zu",
+                       memory_budget_bytes / (1024U * 1024U));
+        cbm_log_info("daemon.index.worker_budget", "project", job->project_key, "active_jobs",
+                     active_text, "aggregate_mb", aggregate_text, "slice_mb", slice_text);
+    }
+
     cbm_daemon_application_worker_t worker = NULL;
     application_tmp_lock();
-    int start_result = application->worker_ops.start(
-        application->worker_ops.context, job->args_json, application->worker_memory_budget_bytes,
-        marker_path, quarantine_path, &worker);
+    int start_result =
+        application->worker_ops.start(application->worker_ops.context, job->args_json,
+                                      memory_budget_bytes, marker_path, quarantine_path, &worker);
     application_tmp_unlock();
     if (start_result != 0 || !worker) {
         return application_job_cancel_requested(job) ? APPLICATION_ATTEMPT_CANCELLED
@@ -1394,6 +1445,11 @@ static void application_auto_index_retry_pending_locked(cbm_daemon_application_t
             session->auto_index_retry_pending = false;
             continue;
         }
+        if (!application_session_workspace_allowed(session, "auto_index_retry")) {
+            session->auto_index_retry_pending = false;
+            application_refresh_watch_locked(session);
+            continue;
+        }
         if (application_regular_db_exists(project)) {
             session->auto_index_retry_pending = false;
             application_refresh_watch_locked(session);
@@ -1533,6 +1589,22 @@ static size_t application_active_job_count_locked(cbm_daemon_application_t *appl
     return count;
 }
 
+/* Decision 2 (#1997 #832): a worker's memory slice is the aggregate budget
+ * divided by the jobs active at spawn time. The job being spawned is already
+ * in the table, so the divisor never drops below one; a zero aggregate means
+ * "no cap" and the worker falls back to its own RAM-fraction budget. */
+static size_t application_worker_memory_slice_locked(cbm_daemon_application_t *application,
+                                                     size_t *active_jobs_out) {
+    size_t active = application_active_job_count_locked(application);
+    if (active == 0) {
+        active = 1;
+    }
+    if (active_jobs_out) {
+        *active_jobs_out = active;
+    }
+    return application->aggregate_memory_budget_bytes / active;
+}
+
 /* Compare the effective index request, not its JSON spelling. yyjson's deep
  * equality treats object member order as insignificant, while the small
  * normalization below removes values that the index handler interprets as
@@ -1557,6 +1629,33 @@ static bool application_index_args_normalize_defaults(yyjson_mut_val *root) {
     return true;
 }
 
+/* One directory is one root. The auto-index job spells repo_path the way the
+ * session policy holds it - the platform's native form, backslashes on
+ * Windows - while an explicit index_repository request arrives in the
+ * handler's forward-slash spelling. Compared byte-exact the two never matched
+ * on Windows, and the request was refused as an options conflict instead of
+ * joining the job already running for its root. The policy keeps its
+ * spelling: the sensitive-root and allowed-root containment checks match it
+ * byte-exact against HOME and the granted roots, and respelling it there
+ * admitted $HOME. So the fold happens here, on this comparison's private copy,
+ * and nothing the daemon stores changes. */
+static bool application_index_args_fold_repo_path(yyjson_mut_doc *document) {
+    yyjson_mut_val *root = yyjson_mut_doc_get_root(document);
+    yyjson_mut_val *repo_path = yyjson_mut_obj_get(root, "repo_path");
+    if (!repo_path || !yyjson_mut_is_str(repo_path)) {
+        return true;
+    }
+    char *folded = strdup(yyjson_mut_get_str(repo_path));
+    if (!folded) {
+        return false;
+    }
+    cbm_normalize_path_sep(folded);
+    yyjson_mut_val *key = yyjson_mut_str(document, "repo_path");
+    yyjson_mut_val *value = yyjson_mut_strcpy(document, folded);
+    free(folded);
+    return key && value && yyjson_mut_obj_replace(root, key, value);
+}
+
 static bool application_index_args_equal(const char *left, const char *right) {
     if (!left || !right) {
         return false;
@@ -1569,12 +1668,18 @@ static bool application_index_args_equal(const char *left, const char *right) {
     yyjson_mut_val *right_root = right_copy ? yyjson_mut_doc_get_root(right_copy) : NULL;
     bool equal = application_index_args_normalize_defaults(left_root) &&
                  application_index_args_normalize_defaults(right_root) &&
+                 application_index_args_fold_repo_path(left_copy) &&
+                 application_index_args_fold_repo_path(right_copy) &&
                  yyjson_mut_equals(left_root, right_root);
     yyjson_mut_doc_free(left_copy);
     yyjson_mut_doc_free(right_copy);
     yyjson_doc_free(left_source);
     yyjson_doc_free(right_source);
     return equal;
+}
+
+bool cbm_daemon_application_index_args_equal_for_test(const char *left, const char *right) {
+    return application_index_args_equal(left, right);
 }
 
 /* Caller holds application->mutex. Keeping watcher ownership validation and
@@ -1754,7 +1859,7 @@ static void application_update_publish_terminal_locked(cbm_daemon_application_t 
         (void)snprintf(application->update_notice, sizeof(application->update_notice),
                        "Update available: %s -> %s -- run: codebase-memory-mcp update  |  "
                        "Enjoying codebase-memory-mcp? Please leave a star: "
-                       "https://github.com/DeusData/codebase-memory-mcp",
+                       "https://github.com/Be90nia/codebase-memory-mcp-pro",
                        cbm_cli_get_version(), latest_version);
         cbm_log_info("update.available", "current", cbm_cli_get_version(), "latest",
                      latest_version);
@@ -1940,6 +2045,10 @@ static void application_background_initialize_impl(cbm_daemon_application_sessio
                             : CBM_MCP_DEFAULT_AUTO_INDEX_LIMIT;
     int tracked_files = -1;
     bool auto_index_candidate = auto_index && !db_exists;
+    if (auto_index_candidate &&
+        !application_session_workspace_allowed(session, "auto_index_discovery")) {
+        auto_index_candidate = false;
+    }
     bool within_auto_index_limit =
         !auto_index_candidate ||
         cbm_mcp_auto_index_within_file_limit(root_path, auto_index_limit, &tracked_files);
@@ -2324,9 +2433,7 @@ static cbm_daemon_runtime_application_status_t application_set_context(
     if (canonical && allowed_present) {
         canonical = cbm_canonical_path(allowed, canonical_allowed, sizeof(canonical_allowed));
     }
-    struct stat root_status;
-    canonical =
-        canonical && stat(canonical_root, &root_status) == 0 && S_ISDIR(root_status.st_mode);
+    canonical = canonical && application_canonical_directory_exists(canonical_root);
     bool set =
         canonical && cbm_mcp_server_set_session_context(session->mcp, canonical_root,
                                                         allowed_present ? canonical_allowed : NULL);
@@ -2882,18 +2989,19 @@ cbm_daemon_application_t *cbm_daemon_application_new(
             application->ui_readiness_secret_set = true;
         }
     }
-    /* Equal fixed slices keep admission deterministic: starting fewer jobs does
-     * not let an early worker claim memory reserved for later concurrent jobs.
-     * The absurd sub-byte-per-slot case is made safe by reducing effective
-     * capacity before division; normal daemon budgets are many orders larger. */
+    /* The per-worker slice is decided at spawn time (see
+     * application_worker_memory_slice_locked): the aggregate divided by the
+     * jobs active then, so a lone worker may use the whole aggregate and
+     * concurrent jobs split it (decision 2, #1997 #832) — the former fixed
+     * aggregate/limit slice starved a lone job on hosts like #1864. The absurd
+     * sub-byte-per-slot case is still made safe by reducing effective capacity
+     * so every admitted job can receive at least one byte; normal daemon
+     * budgets are many orders larger. */
     if (aggregate_memory_budget_bytes > 0 &&
         application->physical_job_limit > aggregate_memory_budget_bytes) {
         application->physical_job_limit = aggregate_memory_budget_bytes;
     }
-    if (aggregate_memory_budget_bytes > 0 && application->physical_job_limit > 0) {
-        application->worker_memory_budget_bytes =
-            aggregate_memory_budget_bytes / application->physical_job_limit;
-    }
+    application->aggregate_memory_budget_bytes = aggregate_memory_budget_bytes;
     if (!application->worker_ops.start) {
         application->worker_ops = (cbm_daemon_application_worker_ops_t){
             .context = NULL,
@@ -3339,9 +3447,8 @@ static int application_background_index(cbm_daemon_application_t *application,
         return -1;
     }
     char canonical_root[APPLICATION_PATH_CAP];
-    struct stat root_status;
     if (!cbm_canonical_path(root_path, canonical_root, sizeof(canonical_root)) ||
-        stat(canonical_root, &root_status) != 0 || !S_ISDIR(root_status.st_mode)) {
+        !application_canonical_directory_exists(canonical_root)) {
         return -1;
     }
     yyjson_mut_doc *document = yyjson_mut_doc_new(NULL);
@@ -3493,7 +3600,7 @@ size_t cbm_daemon_application_worker_memory_budget_bytes(cbm_daemon_application_
         return 0;
     }
     cbm_mutex_lock(&application->mutex);
-    size_t budget = application->worker_memory_budget_bytes;
+    size_t budget = application_worker_memory_slice_locked(application, NULL);
     cbm_mutex_unlock(&application->mutex);
     return budget;
 }
