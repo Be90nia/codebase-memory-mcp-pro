@@ -496,12 +496,20 @@ try:
     # sees a "no surviving descendant" race. Use TerminateProcess via
     # taskkill /F (no /T) to keep the descendant alive for the refusal probe.
     if os.name == "nt":
-        subprocess.run(
+        completed = subprocess.run(
             ["taskkill.exe", "/PID", str(leader_pid), "/F"],
             check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
+        if completed.returncode != 0:
+            raise SystemExit(
+                f"FAIL: taskkill could not kill the race leader "
+                f"(rc={completed.returncode}, "
+                f"stdout={completed.stdout.decode('utf-8', 'replace')!r}, "
+                f"stderr={completed.stderr.decode('utf-8', 'replace')!r}, "
+                f"leader_pid={leader_pid})"
+            )
     else:
         os.kill(leader_pid, signal.SIGTERM)
     deadline = time.monotonic() + 3
