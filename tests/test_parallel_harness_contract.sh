@@ -493,23 +493,30 @@ try:
     # in run-test-wave.py). Python ignores that signal, so the leader never
     # actually exits and the scheduler falls through to its taskkill /T path
     # -- which kills the descendant along with the leader and the contract
-    # sees a "no surviving descendant" race. Use TerminateProcess via
-    # taskkill /F (no /T) to keep the descendant alive for the refusal probe.
+    # sees a "no surviving descendant" race.
+    #
+    # taskkill.exe in PATH is ambiguous on MSYS runners (msys-core ships its
+    # own taskkill, which only sees the MSYS process table), so call
+    # TerminateProcess directly via the Win32 API. That kills the Windows
+    # process by handle regardless of which "taskkill" the shell would have
+    # found, and without /T so the descendant is left for the refusal probe.
     if os.name == "nt":
-        completed = subprocess.run(
-            ["taskkill.exe", "/PID", str(leader_pid), "/F"],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        if completed.returncode != 0:
+        handle = ctypes.windll.kernel32.OpenProcess(0x0001, False, leader_pid)
+        if not handle:
             raise SystemExit(
-                f"FAIL: taskkill could not kill the race leader "
-                f"(rc={completed.returncode}, "
-                f"stdout={completed.stdout.decode('utf-8', 'replace')!r}, "
-                f"stderr={completed.stderr.decode('utf-8', 'replace')!r}, "
-                f"leader_pid={leader_pid})"
+                f"FAIL: could not open the race leader handle "
+                f"(leader_pid={leader_pid}, last_error="
+                f"{ctypes.GetLastError()})"
             )
+        try:
+            if not ctypes.windll.kernel32.TerminateProcess(handle, 0):
+                raise SystemExit(
+                    f"FAIL: TerminateProcess refused the race leader "
+                    f"(leader_pid={leader_pid}, last_error="
+                    f"{ctypes.GetLastError()})"
+                )
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
     else:
         os.kill(leader_pid, signal.SIGTERM)
     deadline = time.monotonic() + 3
