@@ -368,7 +368,12 @@ PY
 printf '%s\n' timeout_exit_race >"$fixture/suites.txt"
 : >"$fixture/results.txt"
 rm -f "$fixture/descendant.pid"
-: >"$fixture/barrier/timeout_exit_race.hold"
+# Write the barrier hold from Python: bash's mktemp -d path (e.g.
+# /tmp/cbm-parallel-harness.XXXXXX) and Python's pathlib.Path on Windows
+# resolve that prefix to different locations, so the scheduler's
+# `wait_for_test_pre_terminate_barrier` (which only ever sees the Python
+# view) cannot see a hold file bash wrote. Move the write inside the same
+# interpreter that owns the scheduler invocation.
 python3 - "$scheduler" "$fixture" "$(command -v python3)" <<'PY'
 from __future__ import annotations
 
@@ -390,6 +395,15 @@ ready = barrier / "timeout_exit_race.ready"
 leader_exited = barrier / "timeout_exit_race.leader-exited"
 release = barrier / "timeout_exit_race.release"
 descendant_path = fixture / "descendant.pid"
+
+# Write the barrier hold from this interpreter: bash mktemp -d resolves the
+# /tmp prefix via the MSYS mount table, while pathlib.Path on Windows treats
+# /tmp as a drive-relative path. A hold file bash writes and a barrier
+# scheduler reads therefore land in different directories. Writing the
+# hold here, with the same pathlib view the scheduler will use, makes
+# them land in the same directory.
+barrier.mkdir(parents=True, exist_ok=True)
+(barrier / "timeout_exit_race.hold").touch()
 
 
 def process_state(pid: int) -> str:
