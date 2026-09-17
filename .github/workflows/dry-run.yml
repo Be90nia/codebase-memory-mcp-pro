@@ -70,11 +70,6 @@ jobs:
       security-events: read
       actions: read
     secrets: inherit
-    # codeql-gate 6h timeout is a runner-capacity issue, not a code one.
-    # A more durable fix (cache + explicit timeout-minutes: 720 in
-    # codeql.yml) belongs upstream. For now, let the security island's
-    # eventual red be visible without reddening the whole dry-run.
-    continue-on-error: true
 
   # ── Lint (cppcheck + clang-format) ────────────────────────────
   lint:
