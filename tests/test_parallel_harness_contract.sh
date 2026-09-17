@@ -474,7 +474,22 @@ try:
         time.sleep(0.02)
 
     leader_pid = int(ready.read_text(encoding="utf-8"))
-    os.kill(leader_pid, signal.SIGTERM)
+    # On Windows, os.kill(pid, SIGTERM) translates to CTRL_BREAK_EVENT for
+    # processes started with CREATE_NEW_PROCESS_GROUP (as the scheduler does
+    # in run-test-wave.py). Python ignores that signal, so the leader never
+    # actually exits and the scheduler falls through to its taskkill /T path
+    # -- which kills the descendant along with the leader and the contract
+    # sees a "no surviving descendant" race. Use TerminateProcess via
+    # taskkill /F (no /T) to keep the descendant alive for the refusal probe.
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill.exe", "/PID", str(leader_pid), "/F"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    else:
+        os.kill(leader_pid, signal.SIGTERM)
     deadline = time.monotonic() + 3
     while not leader_exited.exists():
         if process.poll() is not None:
